@@ -20,7 +20,12 @@ AI client -> hammertime-mcp.exe -> named pipe -> HammerTime.Mcp.Plugin -> Hammer
 
 ## Watch HammerTimeMCP in action:
 
-[![Hallway Demo](media/hallway-thumbnail.png)](https://github.com/BlackShadow/HammerTime-MCP/blob/main/media/Hallway-Demo.mp4)
+<p align="center" width="100%">
+  <video src="https://github.com/user-attachments/assets/4f1c94d2-e8ef-44ea-bfdd-0a167e87c762"
+         width="80%"
+         controls>
+  </video>
+</p>
 
 ## Project Layout
 
