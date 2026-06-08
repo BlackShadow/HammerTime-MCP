@@ -21,14 +21,17 @@ AI client -> hammertime-mcp.exe -> named pipe -> HammerTime.Mcp.Plugin -> Hammer
 
 ## Expectations:
 
-HammerTimeMCP can create you playable maps however it shouldn't be treated as a complete map maker.
-The reason is, AI is not advanced enough to create very detailed worlds. With your directions and your own edits
-you can create maps much faster. Your prompts are very important. With good prompting you can create really good maps/brushes.
+HammerTime-MCP can create playable maps, but it should not be treated as a complete scratch to finish map-making solution. AI is not yet advanced enough to reliably create highly detailed worlds on its own. 
+However, with clear directions and your own manual edits, it can help you create maps much faster. Prompt quality is very important. The better your instructions are, the better the result on the maps, brushes, and layouts will be.
 
-So far in our tests (as in now) Gemini 3.5 Flash is best at creating brushes. Second is Claude Opus 4.7/4.8 and ChatGPT was mixed between Eh and bad.
+In our current testing, Gemini 3.5 Flash has performed best at creating brushes. Claude Opus 4.7/4.8 comes second, while ChatGPT has been mixed, ranging from acceptable to poor for brush creation.
 
-However fixing scripting issues, where GPT 5.5 was really good at. Was this fault of the MCP? No. Like stated earlier AI models are not good enough to create very detailed worlds. 
-However this will change future with newer AI models. AI models will be able to create more visually appealing levels.
+However, when it comes to fixing scripting issues, GPT-5.5 has performed very well.
+
+Is this the fault of the MCP? No. As mentioned earlier, current AI models are not yet good enough to create highly detailed worlds by themselves. This will likely improve with future AI models, which should be able to create more visually appealing and complex levels.
+
+For now, HammerTime-MCP works best as a map-making assistant: it can speed up your workflow, generate useful starting points, and help with scripting or layout ideas, but the best results still come from combining AI generation with human direction and editing.
+
 
 ## Watch HammerTimeMCP in action:
 
