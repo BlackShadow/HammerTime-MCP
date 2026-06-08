@@ -77,7 +77,7 @@ If HammerTime is in a custom location, pass its editor output path:
 dotnet build .\HammerTime.MCP.sln -c Debug /p:Platform="Any CPU" /p:HammerTimeEditorOutput="C:\Path\To\HammertimeEditor\"
 ```
 
-## Install
+## Installation & Usage
 
 Download the zip file in Releases
 
@@ -91,13 +91,13 @@ Make sure HammerTime is not running while installing.
 
 The installer can configure several MCP clients, including Codex, Cursor, VS Code, Claude, Windsurf, OpenCode, Kimi Code, Antigravity, and Gemini CLI.
 
-If HammerTime path is not detected automatically:
+Installer should auto-detect HammerTime installation path but if path is not detected automatically:
 
 ```powershell
 .\MCP-Install\install.bat codex user "C:\Program Files (x86)\HammertimeEditor"
 ```
 
-Restart HammerTime after installing or updating the plugin.
+After a successful install, Run HammerTime and restart your AI CLI or IDE.
 
 ## Verify
 
