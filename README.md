@@ -18,6 +18,18 @@ AI client -> hammertime-mcp.exe -> named pipe -> HammerTime.Mcp.Plugin -> Hammer
 - Run map validation, problem checks, safe fixes, leak pointfile loading, compile profiles, undo, and redo.
 - Configure common MCP clients through the included installer.
 
+
+## Expectations:
+
+HammerTimeMCP can create you playable maps however it shouldn't be treated as a complete map maker.
+Reason for it is, AI is not advanced enough to create very detailed worlds. With your directions and your own edits
+you can create maps much faster.
+
+So far in our tests (as in now) Gemini 3.5 Flash is best at creating brushes. Second is Claude Opus 4.7/4.8 and ChatGPT was straight up bad.
+
+However fixing scripting issues, GPT 5.5 was really good at. Was this fault of the MCP? No. Like stated earlier AI models are not good enough to create very detailed worlds. 
+However this will change future with newer AI models. AI models will be able to create more visually appealing levels.
+
 ## Watch HammerTimeMCP in action:
 
 <p align="center" width="100%">
