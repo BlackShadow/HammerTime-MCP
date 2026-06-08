@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0-windows7.0</TargetFramework>
+    <AssemblyName>HammerTime.Mcp.Plugin</AssemblyName>
+    <RootNamespace>HammerTime.Mcp.Plugin</RootNamespace>
+    <OutputType>Library</OutputType>
+    <Platforms>AnyCPU;x86;x64</Platforms>
+    <LangVersion>latest</LangVersion>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(UseHammerTimeBinaryReferences)' != 'true'">
+    <ProjectReference Include="..\HammerTime.Mcp.Shared\HammerTime.Mcp.Shared.csproj" />
+    <ProjectReference Include="..\..\HammerTime.Formats.Copy\HammerTime.Formats.csproj" />
+    <ProjectReference Include="..\..\Sledge.BspEditor.Tools\Sledge.BspEditor.Tools.csproj" />
+    <ProjectReference Include="..\..\Sledge.BspEditor\Sledge.BspEditor.csproj" />
+    <ProjectReference Include="..\..\Sledge.BspEditor.Editing\Sledge.BspEditor.Editing.csproj" />
+    <ProjectReference Include="..\..\Sledge.BspEditor.Rendering\Sledge.BspEditor.Rendering.csproj" />
+    <ProjectReference Include="..\..\Sledge.Common\Sledge.Common.csproj" />
+    <ProjectReference Include="..\..\Sledge.DataStructures\Sledge.DataStructures.csproj" />
+    <ProjectReference Include="..\..\Sledge.Rendering\Sledge.Rendering.csproj" />
+    <ProjectReference Include="..\..\Sledge.Shell\Sledge.Shell.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseHammerTimeBinaryReferences)' == 'true'">
+    <ProjectReference Include="..\HammerTime.Mcp.Shared\HammerTime.Mcp.Shared.csproj" />
+    <Reference Include="HammerTime.Formats" HintPath="$(HammerTimeEditorOutput)HammerTime.Formats.dll" Private="false" />
+    <Reference Include="Sledge.Formats.Map" HintPath="$(HammerTimeEditorOutput)Sledge.Formats.Map.dll" Private="false" />
+    <Reference Include="Sledge.BspEditor" HintPath="$(HammerTimeEditorOutput)Sledge.BspEditor.dll" Private="false" />
+    <Reference Include="Sledge.BspEditor.Tools" HintPath="$(HammerTimeEditorOutput)Sledge.BspEditor.Tools.dll" Private="false" />
+    <Reference Include="Sledge.BspEditor.Editing" HintPath="$(HammerTimeEditorOutput)Sledge.BspEditor.Editing.dll" Private="false" />
+    <Reference Include="Sledge.BspEditor.Rendering" HintPath="$(HammerTimeEditorOutput)Sledge.BspEditor.Rendering.dll" Private="false" />
+    <Reference Include="Sledge.Common" HintPath="$(HammerTimeEditorOutput)Sledge.Common.dll" Private="false" />
+    <Reference Include="Sledge.DataStructures" HintPath="$(HammerTimeEditorOutput)Sledge.DataStructures.dll" Private="false" />
+    <Reference Include="Sledge.Providers" HintPath="$(HammerTimeEditorOutput)Sledge.Providers.dll" Private="false" />
+    <Reference Include="Sledge.Rendering" HintPath="$(HammerTimeEditorOutput)Sledge.Rendering.dll" Private="false" />
+    <Reference Include="Sledge.Shell" HintPath="$(HammerTimeEditorOutput)Sledge.Shell.dll" Private="false" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="LogicAndTrick.Oy" Version="1.2.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" GeneratePathProperty="true" />
+    <PackageReference Include="System.ComponentModel.Composition" Version="8.0.0" />
+    <PackageReference Include="System.Numerics.Vectors" Version="4.5.0" />
+  </ItemGroup>
+  <Target Name="ValidateHammerTimeBinaryReferences"
+          BeforeTargets="ResolveReferences"
+          Condition="'$(UseHammerTimeBinaryReferences)' == 'true'">
+    <Error Condition="!Exists('$(HammerTimeEditorOutput)Sledge.BspEditor.dll')"
+           Text="HammerTime editor output was not found at '$(HammerTimeEditorOutput)'. Build HammerTime first or pass /p:HammerTimeEditorOutput=&quot;C:\Path\To\HammerTime\&quot;." />
+  </Target>
+</Project>

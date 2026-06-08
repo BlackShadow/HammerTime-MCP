@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup Condition="'$(SolutionName)' == 'HammerTime.MCP' or '$(SolutionFileName)' == 'HammerTime.MCP.sln'">
+    <UseHammerTimeBinaryReferences>true</UseHammerTimeBinaryReferences>
+    <HammerTimeDefaultInstall>$([System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)'))\HammertimeEditor\</HammerTimeDefaultInstall>
+    <HammerTimeSourceEditorOutput>$(MSBuildThisFileDirectory)..\Sledge.Editor\bin\$(Configuration)\net6.0-windows7.0\</HammerTimeSourceEditorOutput>
+    <HammerTimeEditorOutput Condition="'$(HammerTimeEditorOutput)' == '' and Exists('$(HammerTimeDefaultInstall)Hammertime.Editor.exe')">$(HammerTimeDefaultInstall)</HammerTimeEditorOutput>
+    <HammerTimeEditorOutput Condition="'$(HammerTimeEditorOutput)' == ''">$(HammerTimeSourceEditorOutput)</HammerTimeEditorOutput>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,47 @@
+<Project>
+  <PropertyGroup>
+    <McpBuildInstallBundle Condition="'$(McpBuildInstallBundle)' == '' and ('$(SolutionName)' == 'HammerTime.MCP' or '$(SolutionFileName)' == 'HammerTime.MCP.sln')">true</McpBuildInstallBundle>
+    <McpInstallRoot Condition="'$(McpInstallRoot)' == ''">$(MSBuildThisFileDirectory)MCP-Install\</McpInstallRoot>
+  </PropertyGroup>
+
+  <Target Name="CleanMcpServerBundle"
+          BeforeTargets="Build"
+          Condition="'$(McpBuildInstallBundle)' == 'true' and '$(MSBuildProjectName)' == 'HammerTime.Mcp.Cli'">
+    <RemoveDir Directories="$(McpInstallRoot)Server" />
+    <MakeDir Directories="$(McpInstallRoot)Server" />
+  </Target>
+
+  <Target Name="CopyMcpServerBundle"
+          AfterTargets="Build"
+          Condition="'$(McpBuildInstallBundle)' == 'true' and '$(MSBuildProjectName)' == 'HammerTime.Mcp.Cli'">
+    <ItemGroup>
+      <McpServerBundleFiles Include="$(TargetDir)**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(McpServerBundleFiles)"
+          DestinationFiles="@(McpServerBundleFiles->'$(McpInstallRoot)Server\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CleanMcpPluginBundle"
+          BeforeTargets="Build"
+          Condition="'$(McpBuildInstallBundle)' == 'true' and '$(MSBuildProjectName)' == 'HammerTime.Mcp.Plugin'">
+    <RemoveDir Directories="$(McpInstallRoot)Plugin" />
+    <MakeDir Directories="$(McpInstallRoot)Plugin" />
+  </Target>
+
+  <Target Name="CopyMcpPluginBundle"
+          AfterTargets="Build"
+          Condition="'$(McpBuildInstallBundle)' == 'true' and '$(MSBuildProjectName)' == 'HammerTime.Mcp.Plugin'">
+    <ItemGroup>
+      <McpPluginBundleFiles Include="$(TargetDir)HammerTime.Mcp.Plugin.dll" Condition="Exists('$(TargetDir)HammerTime.Mcp.Plugin.dll')" />
+      <McpPluginBundleFiles Include="$(TargetDir)HammerTime.Mcp.Plugin.pdb" Condition="Exists('$(TargetDir)HammerTime.Mcp.Plugin.pdb')" />
+      <McpPluginBundleFiles Include="$(TargetDir)HammerTime.Mcp.Plugin.deps.json" Condition="Exists('$(TargetDir)HammerTime.Mcp.Plugin.deps.json')" />
+      <McpPluginBundleFiles Include="$(TargetDir)HammerTime.Mcp.Shared.dll" Condition="Exists('$(TargetDir)HammerTime.Mcp.Shared.dll')" />
+      <McpPluginBundleFiles Include="$(TargetDir)HammerTime.Mcp.Shared.pdb" Condition="Exists('$(TargetDir)HammerTime.Mcp.Shared.pdb')" />
+      <McpPluginBundleFiles Include="$(PkgNewtonsoft_Json)\lib\net6.0\Newtonsoft.Json.dll" Condition="Exists('$(PkgNewtonsoft_Json)\lib\net6.0\Newtonsoft.Json.dll')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(McpPluginBundleFiles)"
+          DestinationFolder="$(McpInstallRoot)Plugin\"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>
