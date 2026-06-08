@@ -23,7 +23,7 @@ AI client -> hammertime-mcp.exe -> named pipe -> HammerTime.Mcp.Plugin -> Hammer
 
 HammerTimeMCP can create you playable maps however it shouldn't be treated as a complete map maker.
 Reason for it is, AI is not advanced enough to create very detailed worlds. With your directions and your own edits
-you can create maps much faster.
+you can create maps much faster. Your prompts are very important. With good prompting you can create really good maps/brushes.
 
 So far in our tests (as in now) Gemini 3.5 Flash is best at creating brushes. Second is Claude Opus 4.7/4.8 and ChatGPT was straight up bad.
 
