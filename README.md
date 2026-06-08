@@ -18,6 +18,10 @@ AI client -> hammertime-mcp.exe -> named pipe -> HammerTime.Mcp.Plugin -> Hammer
 - Run map validation, problem checks, safe fixes, leak pointfile loading, compile profiles, undo, and redo.
 - Configure common MCP clients through the included installer.
 
+## Watch HammerTimeMCP in action:
+
+[![Hallway Demo](media/hallway-thumbnail.png)](https://github.com/BlackShadow/HammerTime-MCP/blob/main/media/Hallway-Demo.mp4)
+
 ## Project Layout
 
 ```text
@@ -103,4 +107,4 @@ The bridge config is stored at:
 
 HammerTimeMCP controls the live editor state. Review AI-driven changes before saving important maps, and keep backups or version control for serious work.
 
-## Demos
+
