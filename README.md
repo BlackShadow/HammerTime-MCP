@@ -27,7 +27,7 @@ you can create maps much faster. Your prompts are very important. With good prom
 
 So far in our tests (as in now) Gemini 3.5 Flash is best at creating brushes. Second is Claude Opus 4.7/4.8 and ChatGPT was mixed between Eh and bad.
 
-However fixing scripting issues, GPT 5.5 was really good at. Was this fault of the MCP? No. Like stated earlier AI models are not good enough to create very detailed worlds. 
+However fixing scripting issues, where GPT 5.5 was really good at. Was this fault of the MCP? No. Like stated earlier AI models are not good enough to create very detailed worlds. 
 However this will change future with newer AI models. AI models will be able to create more visually appealing levels.
 
 ## Watch HammerTimeMCP in action:
