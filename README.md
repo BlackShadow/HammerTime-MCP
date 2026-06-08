@@ -1,2 +1,1 @@
-# HammerTime-MCP
-HammerTime-MCP is an MCP integration for HammerTime. Enabling AI-assistance in mapping.
+![Shot_1](https://github.com/BlackShadow/HammerTime-MCP/blob/main/media/Banner.png)
