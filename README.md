@@ -34,7 +34,14 @@ However this will change future with newer AI models. AI models will be able to 
 
 <p align="center" width="100%">
   <video src="https://github.com/user-attachments/assets/4f1c94d2-e8ef-44ea-bfdd-0a167e87c762"
-         width="80%"
+         width="50%"
+         controls>
+  </video>
+</p>
+
+<p align="center" width="100%">
+  <video src="https://github.com/user-attachments/assets/723d19f9-5b55-486d-8ac6-8b6bfcd17a6f"
+         width="50%"
          controls>
   </video>
 </p>
@@ -52,8 +59,8 @@ MCP-Install\              Generated install bundle
 ## Requirements
 
 - Windows.
-- HammerTime installed or built locally.
-- .NET 8 runtime for the MCP server.
+- [HammerTime](https://github.com/Duude92/hammertime) installed or built locally.
+- [.NET 8 Runtime](https://dotnet.microsoft.com/en-us/download/dotnet/8.0) for the MCP server.
 - Visual Studio 2022 or the .NET SDK to build from source.
 
 ## Build
@@ -72,21 +79,19 @@ dotnet build .\HammerTime.MCP.sln -c Debug /p:Platform="Any CPU" /p:HammerTimeEd
 
 ## Install
 
+Download the zip file in Releases
+
 Run the bundled installer:
 
 ```powershell
 .\MCP-Install\install.bat
 ```
 
+Make sure HammerTime is not running while installing.
+
 The installer can configure several MCP clients, including Codex, Cursor, VS Code, Claude, Windsurf, OpenCode, Kimi Code, Antigravity, and Gemini CLI.
 
-To install specific clients without the menu:
-
-```powershell
-.\MCP-Install\install.bat codex,cursor,vscode user
-```
-
-If HammerTime is not detected automatically:
+If HammerTime path is not detected automatically:
 
 ```powershell
 .\MCP-Install\install.bat codex user "C:\Program Files (x86)\HammertimeEditor"
