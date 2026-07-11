@@ -23,10 +23,8 @@
     <Copy SourceFiles="@(McpServerBundleFiles)"
           DestinationFiles="@(McpServerBundleFiles->'$(McpInstallRootDir)Server\%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="false" />
-    <Copy SourceFiles="$(McpInstallRootDir)SKILL.md"
-          DestinationFolder="$(McpInstallRootDir)Server\"
-          SkipUnchangedFiles="false"
-          Condition="Exists('$(McpInstallRootDir)SKILL.md')" />
+    <!-- No SKILL.md copy here: the canonical MCP-Install\SKILL.md is the single source.
+         Install resolves it via the exe's ..\SKILL.md fallback (ResolveSkillSourcePath). -->
     <Message Text="[MCP] Server bundle copied." Importance="high" />
   </Target>
 
@@ -52,12 +50,8 @@
     <Copy SourceFiles="@(McpPluginBundleFiles)"
           DestinationFolder="$(McpInstallRootDir)Plugin\"
           SkipUnchangedFiles="false" />
-    <!-- The canonical skill lives at MCP-Install\SKILL.md; CleanMcpPluginBundle wipes Plugin\,
-         so it must be restored here or the bundle ships without a skill source. -->
-    <Copy SourceFiles="$(McpInstallRootDir)SKILL.md"
-          DestinationFolder="$(McpInstallRootDir)Plugin\"
-          SkipUnchangedFiles="false"
-          Condition="Exists('$(McpInstallRootDir)SKILL.md')" />
+    <!-- No SKILL.md copy here: nothing reads a plugin-local skill (SkillSummary uses
+         config.SkillPath / AppData). Canonical stays at MCP-Install\SKILL.md only. -->
     <Message Text="[MCP] Plugin bundle copied." Importance="high" />
   </Target>
 </Project>
