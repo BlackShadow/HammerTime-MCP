@@ -1,37 +1,45 @@
 <Project>
   <PropertyGroup>
-    <McpBuildInstallBundle Condition="'$(McpBuildInstallBundle)' == '' and ('$(SolutionName)' == 'HammerTime.MCP' or '$(SolutionFileName)' == 'HammerTime.MCP.sln')">true</McpBuildInstallBundle>
+    <McpBuildInstallBundle Condition="'$(McpBuildInstallBundle)' == '' and '$(BuildingInsideVisualStudio)' == 'true'">true</McpBuildInstallBundle>
+    <McpBuildInstallBundle Condition="'$(McpBuildInstallBundle)' == ''">false</McpBuildInstallBundle>
     <McpInstallRoot Condition="'$(McpInstallRoot)' == ''">$(MSBuildThisFileDirectory)MCP-Install\</McpInstallRoot>
+    <McpInstallRootDir>$([MSBuild]::EnsureTrailingSlash('$(McpInstallRoot)'))</McpInstallRootDir>
   </PropertyGroup>
 
   <Target Name="CleanMcpServerBundle"
           BeforeTargets="Build"
-          Condition="'$(McpBuildInstallBundle)' == 'true' and '$(MSBuildProjectName)' == 'HammerTime.Mcp.Cli'">
-    <RemoveDir Directories="$(McpInstallRoot)Server" />
-    <MakeDir Directories="$(McpInstallRoot)Server" />
+          Condition="'$(MSBuildProjectName)' == 'HammerTime.Mcp.Cli' and '$(McpBuildInstallBundle)' == 'true'">
+    <RemoveDir Directories="$(McpInstallRootDir)Server" ContinueOnError="true" />
+    <MakeDir Directories="$(McpInstallRootDir)Server" />
   </Target>
 
   <Target Name="CopyMcpServerBundle"
           AfterTargets="Build"
-          Condition="'$(McpBuildInstallBundle)' == 'true' and '$(MSBuildProjectName)' == 'HammerTime.Mcp.Cli'">
+          Condition="'$(MSBuildProjectName)' == 'HammerTime.Mcp.Cli' and '$(McpBuildInstallBundle)' == 'true'">
     <ItemGroup>
       <McpServerBundleFiles Include="$(TargetDir)**\*.*" />
     </ItemGroup>
+    <Message Text="[MCP] Copying server bundle to $(McpInstallRootDir)Server\" Importance="high" />
     <Copy SourceFiles="@(McpServerBundleFiles)"
-          DestinationFiles="@(McpServerBundleFiles->'$(McpInstallRoot)Server\%(RecursiveDir)%(Filename)%(Extension)')"
-          SkipUnchangedFiles="true" />
+          DestinationFiles="@(McpServerBundleFiles->'$(McpInstallRootDir)Server\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="false" />
+    <Copy SourceFiles="$(McpInstallRootDir)SKILL.md"
+          DestinationFolder="$(McpInstallRootDir)Server\"
+          SkipUnchangedFiles="false"
+          Condition="Exists('$(McpInstallRootDir)SKILL.md')" />
+    <Message Text="[MCP] Server bundle copied." Importance="high" />
   </Target>
 
   <Target Name="CleanMcpPluginBundle"
           BeforeTargets="Build"
-          Condition="'$(McpBuildInstallBundle)' == 'true' and '$(MSBuildProjectName)' == 'HammerTime.Mcp.Plugin'">
-    <RemoveDir Directories="$(McpInstallRoot)Plugin" />
-    <MakeDir Directories="$(McpInstallRoot)Plugin" />
+          Condition="'$(MSBuildProjectName)' == 'HammerTime.Mcp.Plugin' and '$(McpBuildInstallBundle)' == 'true'">
+    <RemoveDir Directories="$(McpInstallRootDir)Plugin" ContinueOnError="true" />
+    <MakeDir Directories="$(McpInstallRootDir)Plugin" />
   </Target>
 
   <Target Name="CopyMcpPluginBundle"
           AfterTargets="Build"
-          Condition="'$(McpBuildInstallBundle)' == 'true' and '$(MSBuildProjectName)' == 'HammerTime.Mcp.Plugin'">
+          Condition="'$(MSBuildProjectName)' == 'HammerTime.Mcp.Plugin' and '$(McpBuildInstallBundle)' == 'true'">
     <ItemGroup>
       <McpPluginBundleFiles Include="$(TargetDir)HammerTime.Mcp.Plugin.dll" Condition="Exists('$(TargetDir)HammerTime.Mcp.Plugin.dll')" />
       <McpPluginBundleFiles Include="$(TargetDir)HammerTime.Mcp.Plugin.pdb" Condition="Exists('$(TargetDir)HammerTime.Mcp.Plugin.pdb')" />
@@ -40,8 +48,16 @@
       <McpPluginBundleFiles Include="$(TargetDir)HammerTime.Mcp.Shared.pdb" Condition="Exists('$(TargetDir)HammerTime.Mcp.Shared.pdb')" />
       <McpPluginBundleFiles Include="$(PkgNewtonsoft_Json)\lib\net6.0\Newtonsoft.Json.dll" Condition="Exists('$(PkgNewtonsoft_Json)\lib\net6.0\Newtonsoft.Json.dll')" />
     </ItemGroup>
+    <Message Text="[MCP] Copying plugin bundle to $(McpInstallRootDir)Plugin\" Importance="high" />
     <Copy SourceFiles="@(McpPluginBundleFiles)"
-          DestinationFolder="$(McpInstallRoot)Plugin\"
-          SkipUnchangedFiles="true" />
+          DestinationFolder="$(McpInstallRootDir)Plugin\"
+          SkipUnchangedFiles="false" />
+    <!-- The canonical skill lives at MCP-Install\SKILL.md; CleanMcpPluginBundle wipes Plugin\,
+         so it must be restored here or the bundle ships without a skill source. -->
+    <Copy SourceFiles="$(McpInstallRootDir)SKILL.md"
+          DestinationFolder="$(McpInstallRootDir)Plugin\"
+          SkipUnchangedFiles="false"
+          Condition="Exists('$(McpInstallRootDir)SKILL.md')" />
+    <Message Text="[MCP] Plugin bundle copied." Importance="high" />
   </Target>
 </Project>

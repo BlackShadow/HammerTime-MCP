@@ -15,6 +15,15 @@ namespace HammerTime.Mcp.Shared
         [JsonProperty("hammerTimeDirectory")]
         public string HammerTimeDirectory { get; set; }
 
+        [JsonProperty("skillPath")]
+        public string SkillPath { get; set; }
+
+        [JsonProperty("skillHash")]
+        public string SkillHash { get; set; }
+
+        [JsonProperty("bridgeTimeoutMs")]
+        public int? BridgeTimeoutMs { get; set; }
+
         public static string GetDefaultConfigPath()
         {
             return Path.Combine(
@@ -23,13 +32,34 @@ namespace HammerTime.Mcp.Shared
                 "config.json");
         }
 
+        public static string GetDefaultSkillPath()
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "HammerTime.MCP",
+                "skills",
+                "hammertime-goldsrc-brushwork",
+                "SKILL.md");
+        }
+
+        public static string GetCodexSkillPath()
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".codex",
+                "skills",
+                "hammertime-goldsrc-brushwork",
+                "SKILL.md");
+        }
+
         public static McpBridgeConfig CreateDefault(string hammerTimeDirectory = null)
         {
             return new McpBridgeConfig
             {
                 PipeName = "hammertime-mcp-" + Environment.UserName.Replace('\\', '_'),
                 Token = Guid.NewGuid().ToString("N"),
-                HammerTimeDirectory = hammerTimeDirectory
+                HammerTimeDirectory = hammerTimeDirectory,
+                SkillPath = GetDefaultSkillPath()
             };
         }
 
@@ -38,11 +68,18 @@ namespace HammerTime.Mcp.Shared
             path = path ?? GetDefaultConfigPath();
             if (File.Exists(path))
             {
-                var existing = JsonConvert.DeserializeObject<McpBridgeConfig>(File.ReadAllText(path));
-                if (existing != null && !string.IsNullOrWhiteSpace(existing.PipeName) && !string.IsNullOrWhiteSpace(existing.Token))
+                try
                 {
-                    if (!string.IsNullOrWhiteSpace(hammerTimeDirectory)) existing.HammerTimeDirectory = hammerTimeDirectory;
-                    return existing;
+                    var existing = JsonConvert.DeserializeObject<McpBridgeConfig>(File.ReadAllText(path));
+                    if (existing != null && !string.IsNullOrWhiteSpace(existing.PipeName) && !string.IsNullOrWhiteSpace(existing.Token))
+                    {
+                        if (!string.IsNullOrWhiteSpace(hammerTimeDirectory)) existing.HammerTimeDirectory = hammerTimeDirectory;
+                        if (string.IsNullOrWhiteSpace(existing.SkillPath)) existing.SkillPath = GetDefaultSkillPath();
+                        return existing;
+                    }
+                }
+                catch (JsonException)
+                {
                 }
             }
 

@@ -6,6 +6,11 @@ set "CLIENTS=%~1"
 set "SCOPE=%~2"
 set "HAMMERTIME_DIR=%~3"
 
+echo.
+echo Stopping any running HammerTime MCP server...
+taskkill /F /IM hammertime-mcp.exe /T 2>nul
+if %ERRORLEVEL%==0 echo HammerTime MCP server was running and has been stopped.
+
 if not defined SCOPE set "SCOPE=user"
 
 if /I "%SCOPE%"=="project" goto ScopeOk

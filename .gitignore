@@ -1,0 +1,8 @@
+# Build output
+MCP/**/bin/
+MCP/**/obj/
+MCP/.vs/
+
+# Generated install bundle (produced by Directory.Build.targets; canonical skill is MCP-Install/SKILL.md)
+MCP/MCP-Install/Server/
+MCP/MCP-Install/Plugin/

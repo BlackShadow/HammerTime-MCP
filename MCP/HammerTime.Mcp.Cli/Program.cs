@@ -1,13 +1,18 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using HammerTime.Mcp.Shared;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+
+[assembly: InternalsVisibleTo("HammerTime.Mcp.Tests")]
 
 namespace HammerTime.Mcp.Cli
 {
@@ -16,6 +21,16 @@ namespace HammerTime.Mcp.Cli
         private const string ServerName = "hammertime";
         private const string ServerVersion = "0.1.0";
         private const string DefaultProtocolVersion = "2025-11-25";
+
+        // Candidate editor process names checked by both the serve watchdog and the installer.
+        private static readonly string[] EditorProcessNames = { "Hammertime.Editor", "HammertimeEditor", "Sledge.Editor" };
+
+        // Exposed for schema-quality tests via InternalsVisibleTo. Building the list also
+        // validates that every catalog tool resolves to a schema (SchemaForCatalogTool throws otherwise).
+        internal static IReadOnlyList<(string Name, JObject Schema)> ToolSchemasForTest()
+        {
+            return ToolDefinition.CreateAll().Select(t => (t.Name, t.InputSchema)).ToList();
+        }
 
         public static async Task<int> Main(string[] args)
         {
@@ -118,10 +133,49 @@ namespace HammerTime.Mcp.Cli
 
         private sealed class McpStdioServer
         {
+            private const string SkillResourceUri = "hammertime://skill/goldsrc-brushwork";
             private readonly List<ToolDefinition> _tools = ToolDefinition.CreateAll();
 
             public async Task Run()
             {
+                try
+                {
+                    // MCP stdio framing is UTF-8; the default console code page can corrupt
+                    // non-ASCII payloads. Setting the encoding throws when no console is
+                    // attached (e.g. stdin/stdout redirected), so it is best-effort.
+                    Console.InputEncoding = new UTF8Encoding(false);
+                    Console.OutputEncoding = new UTF8Encoding(false);
+                }
+                catch
+                {
+                    // No console attached; the redirected streams keep their own encoding.
+                }
+
+                var serveStart = DateTime.UtcNow;
+                _ = Task.Run(async () =>
+                {
+                    var absentPolls = 0;
+                    while (true)
+                    {
+                        await Task.Delay(5000);
+                        if (EditorProcessNames.Any(name => Process.GetProcessesByName(name).Length > 0))
+                        {
+                            absentPolls = 0;
+                            continue;
+                        }
+
+                        // Startup grace: tolerate the editor not being up yet. Only exit
+                        // after it has been absent for 3 consecutive polls and at least
+                        // 30 seconds have elapsed since serve started.
+                        absentPolls++;
+                        if (absentPolls >= 3 && (DateTime.UtcNow - serveStart) >= TimeSpan.FromSeconds(30))
+                        {
+                            Console.Error.WriteLine("[MCP] HammerTime Editor is not running. Exiting MCP server.");
+                            Environment.Exit(0);
+                        }
+                    }
+                });
+
                 string line;
                 while ((line = await Console.In.ReadLineAsync()) != null)
                 {
@@ -140,17 +194,25 @@ namespace HammerTime.Mcp.Cli
                     }
 
                     var id = request["id"];
+                    var hasId = id != null && id.Type != JTokenType.Null;
                     var method = request.Value<string>("method");
-                    if (string.IsNullOrWhiteSpace(method)) continue;
+                    if (string.IsNullOrWhiteSpace(method))
+                    {
+                        // A request carrying an id but no method is an Invalid Request; a
+                        // notification (no id) with no method is simply ignored.
+                        if (hasId) await Write(JsonRpcError(id, -32600, "Invalid Request: missing method"));
+                        continue;
+                    }
 
                     try
                     {
                         var response = await Handle(id, method, request["params"] as JObject ?? new JObject());
-                        if (response != null) await Write(response);
+                        // Notifications (absent or null id) never receive a response.
+                        if (response != null && hasId) await Write(response);
                     }
                     catch (Exception ex)
                     {
-                        if (id != null) await Write(JsonRpcError(id, -32000, ex.Message));
+                        if (hasId) await Write(JsonRpcError(id, -32000, ex.Message));
                     }
                 }
             }
@@ -160,10 +222,13 @@ namespace HammerTime.Mcp.Cli
                 switch (method)
                 {
                     case "initialize":
+                        var requestedVersion = parameters.Value<string>("protocolVersion");
+                        var supported = new[] { "2025-11-25", "2025-06-18", "2025-03-26" };
+                        var negotiatedVersion = supported.Contains(requestedVersion) ? requestedVersion : DefaultProtocolVersion;
                         return JsonRpcResult(id, new
                         {
-                            protocolVersion = parameters.Value<string>("protocolVersion") ?? DefaultProtocolVersion,
-                            capabilities = new { tools = new { listChanged = false } },
+                            protocolVersion = negotiatedVersion,
+                            capabilities = new { tools = new { listChanged = false }, resources = new { subscribe = false, listChanged = false } },
                             serverInfo = new { name = ServerName, version = ServerVersion }
                         });
                     case "notifications/initialized":
@@ -174,6 +239,10 @@ namespace HammerTime.Mcp.Cli
                         return JsonRpcResult(id, new { tools = _tools.Select(x => x.ToMcpTool()).ToList() });
                     case "tools/call":
                         return await ToolsCall(id, parameters);
+                    case "resources/list":
+                        return ResourcesList(id);
+                    case "resources/read":
+                        return await ResourcesRead(id, parameters);
                     default:
                         return JsonRpcError(id, -32601, $"Unknown MCP method '{method}'.");
                 }
@@ -185,6 +254,11 @@ namespace HammerTime.Mcp.Cli
                 var args = parameters["arguments"] as JObject ?? new JObject();
                 var tool = _tools.FirstOrDefault(x => string.Equals(x.Name, name, StringComparison.Ordinal));
                 if (tool == null) return JsonRpcError(id, -32602, $"Unknown tool '{name}'.");
+
+                if (string.Equals(tool.BridgeMethod, BridgeMethods.SkillGet, StringComparison.Ordinal))
+                {
+                    return JsonRpcResult(id, McpContentFormatter.CreateToolResult(ReadLocalSkill()));
+                }
 
                 BridgeResponse response;
                 try
@@ -198,14 +272,90 @@ namespace HammerTime.Mcp.Cli
 
                 if (response.Ok)
                 {
-                    return JsonRpcResult(id, new
-                    {
-                        content = new[] { new { type = "text", text = response.Result?.ToString(Formatting.Indented) ?? "null" } },
-                        structuredContent = response.Result
-                    });
+                    return JsonRpcResult(id, McpContentFormatter.CreateToolResult(response.Result));
                 }
 
                 return JsonRpcResult(id, ToolError(response.Error.Code, response.Error.Message));
+            }
+
+            private static JObject ResourcesList(JToken id)
+            {
+                return JsonRpcResult(id, new
+                {
+                    resources = new[]
+                    {
+                        new
+                        {
+                            uri = SkillResourceUri,
+                            name = "HammerTime GoldSrc Brushwork Skill",
+                            description = "Installed HammerTime MCP mapping rules and visual-verification workflow.",
+                            mimeType = "text/markdown"
+                        }
+                    }
+                });
+            }
+
+            private static Task<JObject> ResourcesRead(JToken id, JObject parameters)
+            {
+                var uri = parameters.Value<string>("uri");
+                if (!string.Equals(uri, SkillResourceUri, StringComparison.OrdinalIgnoreCase))
+                {
+                    return Task.FromResult(JsonRpcError(id, -32602, $"Unknown resource '{uri}'."));
+                }
+
+                var skill = ReadLocalSkill();
+                var text = skill.Value<string>("text") ?? "";
+                return Task.FromResult(JsonRpcResult(id, new
+                {
+                    contents = new[]
+                    {
+                        new
+                        {
+                            uri = SkillResourceUri,
+                            mimeType = "text/markdown",
+                            text
+                        }
+                    }
+                }));
+            }
+
+            private static JObject ReadLocalSkill()
+            {
+                var config = McpBridgeConfig.LoadOrCreate();
+                var path = string.IsNullOrWhiteSpace(config.SkillPath) ? McpBridgeConfig.GetDefaultSkillPath() : config.SkillPath;
+                var bundledPath = Path.Combine(AppContext.BaseDirectory, "SKILL.md");
+                var siblingPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "SKILL.md"));
+
+                if (!File.Exists(path) && File.Exists(McpBridgeConfig.GetDefaultSkillPath()))
+                {
+                    path = McpBridgeConfig.GetDefaultSkillPath();
+                }
+                if (!File.Exists(path) && File.Exists(bundledPath))
+                {
+                    path = bundledPath;
+                }
+                if (!File.Exists(path) && File.Exists(siblingPath))
+                {
+                    path = siblingPath;
+                }
+
+                var exists = File.Exists(path);
+                return new JObject
+                {
+                    ["installed"] = exists,
+                    ["path"] = path,
+                    ["hash"] = exists ? ComputeFileSha256(path) : null,
+                    ["text"] = exists ? File.ReadAllText(path) : ""
+                };
+            }
+
+            private static string ComputeFileSha256(string path)
+            {
+                using (var sha = SHA256.Create())
+                using (var stream = File.OpenRead(path))
+                {
+                    return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+                }
             }
 
             private static object ToolError(string code, string message)
@@ -230,7 +380,7 @@ namespace HammerTime.Mcp.Cli
                 {
                     ["jsonrpc"] = "2.0",
                     ["id"] = id?.DeepClone(),
-                    ["result"] = result == null ? JValue.CreateNull() : JToken.FromObject(result)
+                    ["result"] = result == null ? JValue.CreateNull() : result is JToken token ? token : JToken.FromObject(result)
                 };
             }
 
@@ -251,32 +401,50 @@ namespace HammerTime.Mcp.Cli
 
         private sealed class BridgePipeClient
         {
-            private readonly McpBridgeConfig _config;
-            private readonly int _timeoutMs;
+            // Connecting to a running editor is fast; a stalled response can take
+            // much longer (large captures, slow edits), so the two are timed apart.
+            private const int ConnectTimeoutMs = 5000;
+            private const int DefaultIoTimeoutMs = 120000;
+            private const int ReadBufferSize = 64 * 1024;
+            private const long MaxLineBytes = 512L * 1024 * 1024;
 
-            private BridgePipeClient(McpBridgeConfig config, int timeoutMs)
+            private readonly McpBridgeConfig _config;
+            private readonly int _connectTimeoutMs;
+            private readonly int _ioTimeoutMs;
+
+            private BridgePipeClient(McpBridgeConfig config, int connectTimeoutMs, int ioTimeoutMs)
             {
                 _config = config;
-                _timeoutMs = timeoutMs;
+                _connectTimeoutMs = connectTimeoutMs;
+                _ioTimeoutMs = ioTimeoutMs;
             }
 
-            public static BridgePipeClient FromConfig(int timeoutMs = 5000)
+            public static BridgePipeClient FromConfig()
             {
-                return new BridgePipeClient(McpBridgeConfig.LoadOrCreate(), timeoutMs);
+                var config = McpBridgeConfig.LoadOrCreate();
+                return new BridgePipeClient(config, ConnectTimeoutMs, ResolveIoTimeout(config));
             }
 
             public static BridgePipeClient FromArgs(string[] args)
             {
                 var path = Args.Value(args, "--config", null);
-                var timeout = Args.Value(args, "--timeout-ms", 5000);
-                return new BridgePipeClient(McpBridgeConfig.LoadOrCreate(path), timeout);
+                var config = McpBridgeConfig.LoadOrCreate(path);
+                var ioTimeout = Args.Value(args, "--timeout-ms", ResolveIoTimeout(config));
+                return new BridgePipeClient(config, ConnectTimeoutMs, ioTimeout);
+            }
+
+            private static int ResolveIoTimeout(McpBridgeConfig config)
+            {
+                return config.BridgeTimeoutMs.HasValue && config.BridgeTimeoutMs.Value > 0
+                    ? config.BridgeTimeoutMs.Value
+                    : DefaultIoTimeoutMs;
             }
 
             public async Task<BridgeResponse> Send(string method, JObject parameters)
             {
                 using (var pipe = new NamedPipeClientStream(".", _config.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
                 {
-                    await pipe.ConnectAsync(_timeoutMs);
+                    await pipe.ConnectAsync(_connectTimeoutMs);
                     var request = new BridgeRequest
                     {
                         Id = Guid.NewGuid().ToString("N"),
@@ -294,7 +462,7 @@ namespace HammerTime.Mcp.Cli
 
             private async Task WriteLine(Stream stream, string line)
             {
-                using (var cancellation = new System.Threading.CancellationTokenSource(_timeoutMs))
+                using (var cancellation = new System.Threading.CancellationTokenSource(_ioTimeoutMs))
                 {
                     var bytes = Encoding.UTF8.GetBytes(line + "\n");
                     await stream.WriteAsync(bytes, 0, bytes.Length, cancellation.Token);
@@ -304,16 +472,16 @@ namespace HammerTime.Mcp.Cli
 
             private async Task<string> ReadLine(Stream stream)
             {
-                using (var cancellation = new System.Threading.CancellationTokenSource(_timeoutMs))
+                using (var cancellation = new System.Threading.CancellationTokenSource(_ioTimeoutMs))
                 using (var buffer = new MemoryStream())
                 {
-                    var single = new byte[1];
+                    var chunk = new byte[ReadBufferSize];
                     while (true)
                     {
                         int read;
                         try
                         {
-                            read = await stream.ReadAsync(single, 0, 1, cancellation.Token);
+                            read = await stream.ReadAsync(chunk, 0, chunk.Length, cancellation.Token);
                         }
                         catch (OperationCanceledException)
                         {
@@ -321,8 +489,22 @@ namespace HammerTime.Mcp.Cli
                         }
 
                         if (read == 0) return buffer.Length == 0 ? null : Encoding.UTF8.GetString(buffer.ToArray());
-                        if (single[0] == (byte)'\n') return Encoding.UTF8.GetString(buffer.ToArray()).TrimEnd('\r');
-                        buffer.WriteByte(single[0]);
+
+                        for (var i = 0; i < read; i++)
+                        {
+                            if (chunk[i] == (byte)'\n')
+                            {
+                                // The pipe carries exactly one response per call, so any bytes
+                                // buffered after this newline are not needed and are ignored.
+                                return Encoding.UTF8.GetString(buffer.ToArray()).TrimEnd('\r');
+                            }
+
+                            buffer.WriteByte(chunk[i]);
+                            if (buffer.Length > MaxLineBytes)
+                            {
+                                throw new IOException($"HammerTime MCP bridge response exceeded {MaxLineBytes} bytes without a newline.");
+                            }
+                        }
                     }
                 }
             }
@@ -346,16 +528,48 @@ namespace HammerTime.Mcp.Cli
                 var tools = new List<ToolDefinition>
                 {
                     Tool("hammertime_status", BridgeMethods.Status, "Get HammerTime MCP bridge status.", Schema()),
+                    Tool("hammertime_skill", BridgeMethods.SkillGet, "Return the installed HammerTime GoldSrc mapping skill instructions.", Schema()),
                     Tool("documents_list", BridgeMethods.DocumentsList, "List open HammerTime documents.", Schema()),
+                    Tool("documents_new", BridgeMethods.DocumentsNew, "Create a new HammerTime map document/tab.", Schema(("loaderHint", "string", "Optional HammerTime loader type name."))),
                     Tool("documents_open", BridgeMethods.DocumentsOpen, "Open a map document.", Schema(("path", "string", "Map file path."), ("loaderHint", "string", "Optional HammerTime loader type name.")), "path"),
+                    Tool("documents_open_text", BridgeMethods.DocumentsOpenText, "Open a full Hammer .map file from a string.", Schema(("text", "string", "Full .map file text."), ("name", "string", "Display name for the new document."), ("loaderHint", "string", "Optional HammerTime loader type name.")), "text"),
+                    Tool("object_import_maptext_batch", BridgeMethods.ObjectImportMapTextBatch, "Import multiple Hammer .map brush text blocks in one call.", Schema(("texts", "array", "Array of Hammer .map brush text blocks."), ("text", "string", "A single string containing multiple brush blocks."), ("select", "boolean", "Select imported brushes after creation."))),
                     Tool("documents_activate", BridgeMethods.DocumentsActivate, "Activate an open document by path or documentIndex.", Schema(("path", "string", "Open document path."), ("documentIndex", "integer", "Open document index."))),
-                    Tool("documents_save", BridgeMethods.DocumentsSave, "Save the active or specified document.", Schema(("path", "string", "Optional output path."), ("loaderHint", "string", "Optional loader type name."))),
-                    Tool("documents_export", BridgeMethods.DocumentsExport, "Export the active or specified document.", Schema(("path", "string", "Export path."), ("loaderHint", "string", "Optional loader type name.")), "path"),
+                    Tool("documents_save", BridgeMethods.DocumentsSave, "Save the active or specified document.", Schema(("path", "string", "Save-as destination path. When it matches an open document's file name that document is saved in place; otherwise it is the destination and the target is documentIndex or the active document (so untitled documents can be saved). Omit to save in place."), ("documentIndex", "integer", "Target open document index when path is a new destination. Uses the active document when omitted."), ("loaderHint", "string", "Optional loader type name."))),
+                    Tool("documents_export", BridgeMethods.DocumentsExport, "Export the active or specified document.", Schema(("path", "string", "Export destination path. When it matches an open document's file name that document is exported; otherwise it is the destination and the target is documentIndex or the active document (so untitled documents can be exported)."), ("documentIndex", "integer", "Target open document index when path is a new destination. Uses the active document when omitted."), ("loaderHint", "string", "Optional loader type name.")), "path"),
                     Tool("map_snapshot", BridgeMethods.MapSnapshot, "Return a bounded summary of map objects.", Schema(("maxObjects", "integer", "Maximum objects to return."))),
                     Tool("map_search", BridgeMethods.MapSearch, "Search map objects by type, classname, key/value, selected state, or text.", Schema(("type", "string", "Object type, such as Entity or Solid."), ("classname", "string", "Entity classname."), ("key", "string", "Entity property key."), ("value", "string", "Entity property value."), ("text", "string", "Text to search in classnames and properties."), ("selectedOnly", "boolean", "Only search selected objects."), ("max", "integer", "Maximum results."))),
                     Tool("selection_get", BridgeMethods.SelectionGet, "Return selected object IDs and bounds.", Schema()),
-                    Tool("selection_set", BridgeMethods.SelectionSet, "Replace, add, or remove object selection.", Schema(("ids", "array", "Object IDs."), ("mode", "string", "replace, add, or remove.")), "ids"),
-                    Tool("viewport_focus", BridgeMethods.ViewportFocus, "Focus 2D/3D viewports on ids, point, or current selection.", Schema(("ids", "array", "Object IDs."), ("point", "object", "Vector {x,y,z}."), ("views", "string", "all, 2d, or 3d."))),
+                    Tool("selection_set", BridgeMethods.SelectionSet, "Replace, add, or remove object selection.", WithEnum(Schema(("ids", "array", "Object IDs."), ("mode", "string", "How ids affect the selection. Defaults to replace.")), "mode", "replace", "add", "remove"), "ids"),
+                    Tool("viewport_focus", BridgeMethods.ViewportFocus, "Focus 2D/3D viewports on ids, point, or current selection.", WithEnum(Schema(("ids", "array", "Object IDs to frame. Uses point or current selection when omitted."), ("point", "object", "World point to focus on."), ("views", "string", "Which viewports to focus. Defaults to all.")), "views", "all", "2d", "3d")),
+                    Tool("viewport_capture", BridgeMethods.ViewportCapture, "Capture visible HammerTime 3D/2D viewport screenshots for visual inspection.",
+                        WithEnum(WithEnum(WithEnum(WithEnum(Schema(
+                            ("views", "string", "Which viewports to capture. Defaults to all."),
+                            ("method", "string", "Capture method. auto tries GPU readback, then PrintWindow, then screen. Defaults to auto. gpu captures omit ImGui overlay highlights (entity names, gizmos, MCP highlights)."),
+                            ("includeOverlays", "boolean", "Prefer a screen capture that includes overlay highlights/gizmos. Defaults to false."),
+                            ("format", "string", "Output image format. Defaults to png."),
+                            ("jpegQuality", "integer", "JPEG quality 1-100 when format is jpeg. Defaults to 85."),
+                            ("maxWidth", "integer", "Maximum output image width. Defaults to 1024; 0 means native full size."),
+                            ("maxHeight", "integer", "Maximum output image height. Defaults to 1024; 0 means native full size."),
+                            ("waitForFrameMs", "integer", "Milliseconds to wait for a fresh rendered frame before capture. Defaults to 250."),
+                            ("renderMode", "string", "Temporarily switch render mode before capture: textured or wireframe. flat is not supported."),
+                            ("restoreRenderMode", "boolean", "Restore the previous render mode after capture. Defaults to true."),
+                            ("camera", "object", "Optional inline camera pose applied to the selected viewports BEFORE the capture (avoids the freelook race between separate camera_set and capture calls). Same fields as viewport_camera_set: 3D position/lookAt/direction/anglesDegrees/fov (Vectors {x,y,z}, at most one orientation field) apply to perspective viewports; 2D center/zoom apply to orthographic viewports.")),
+                            "views", "all", "3d", "2d", "top", "front", "side", "focused"),
+                            "method", "auto", "gpu", "printwindow", "screen"),
+                            "format", "png", "jpeg"),
+                            "renderMode", "textured", "wireframe")),
+                    Tool("viewport_camera_get", BridgeMethods.ViewportCameraGet, "Return camera state for HammerTime viewports.", WithEnum(Schema(("views", "string", "Which viewports to report. Defaults to all.")), "views", "all", "3d", "2d", "top", "front", "side", "focused")),
+                    Tool("viewport_camera_set", BridgeMethods.ViewportCameraSet, "Set HammerTime 3D camera position/lookAt/angles/FOV or 2D center/zoom.", WithEnum(Schema(
+                        ("views", "string", "Which viewports to modify. Inferred from provided parameters when omitted."),
+                        ("position", "object", "3D camera position Vector {x,y,z}."),
+                        ("lookAt", "object", "3D world point the camera should look at (Vector {x,y,z}). Mutually exclusive with direction and anglesDegrees."),
+                        ("direction", "object", "3D camera forward direction Vector {x,y,z}. Mutually exclusive with lookAt and anglesDegrees."),
+                        ("anglesDegrees", "object", "3D camera Euler angles in degrees {x,y,z}. Mutually exclusive with lookAt and direction."),
+                        ("fov", "number", "3D field of view in degrees (clamped 10-170)."),
+                        ("center", "object", "2D camera center Vector {x,y,z}."),
+                        ("zoom", "number", "2D camera zoom (clamped 0.001-256).")),
+                        "views", "all", "3d", "2d", "top", "front", "side", "focused")),
                     Tool("viewport_clear_marks", BridgeMethods.ViewportClearMarks, "Clear MCP overlay highlights and HammerTime object selection wireframes.", Schema(("clearSelection", "boolean", "Deselect selected map objects."), ("clearOverlay", "boolean", "Clear MCP overlay highlights and leak path."))),
                     Tool("editor_tools_list", BridgeMethods.EditorToolsList, "List HammerTime editor tools, including BrushTool and Vertex Manipulation Tool.", Schema()),
                     Tool("editor_tool_activate", BridgeMethods.EditorToolActivate, "Activate a HammerTime editor tool by name or alias, such as brush, vertex, vm, or select.", Schema(("name", "string", "Tool name or alias.")), "name"),
@@ -366,7 +580,7 @@ namespace HammerTime.Mcp.Cli
                     Tool("scripted_sequence_list", BridgeMethods.ScriptedSequenceList, "List scripted_sequence entities.", Schema(("target", "string", "Optional related target name."))),
                     Tool("scripted_sequence_upsert", BridgeMethods.ScriptedSequenceUpsert, "Create or update a scripted_sequence by id or targetname.", Schema(("id", "integer", "Existing entity ID."), ("targetname", "string", "Sequence targetname."), ("origin", "object", "Vector {x,y,z}."), ("properties", "object", "Additional keyvalues."), ("m_iszEntity", "string", "Target NPC."), ("m_iszPlay", "string", "Animation to play."), ("m_iszIdle", "string", "Idle animation."), ("m_fMoveTo", "string", "Move-to mode."), ("m_flRadius", "string", "Search radius."))),
                     Tool("brush_types_list", BridgeMethods.BrushTypesList, "List HammerTime Brush Tool types and their type-specific parameters.", Schema()),
-                    Tool("brush_create", BridgeMethods.BrushCreate, "Create a HammerTime Brush Tool shape. Valid types: Arch, Block, Tetrahedron, Pyramid, Wedge, Cylinder, Cone, Pipe, Sphere, Torus, Text. Aliases include barrel/barrell/can/tank for Cylinder.", BrushSchema(("type", "string", "Brush type or alias.")), "type", "min", "max"),
+                    Tool("brush_create", BridgeMethods.BrushCreate, "Create a HammerTime Brush Tool shape. Valid types: Arch, Block, Tetrahedron, Pyramid, Wedge, Cylinder, Cone, Pipe, Sphere, Torus, Text. Aliases include barrel/barrell/can/tank for Cylinder.", WithEnum(BrushSchema(("type", "string", "Brush type or alias. Defaults to Block when omitted.")), "type", BrushCatalog.DefaultTypes.Select(x => x.Name).ToArray()), "min", "max"),
                     Tool("brush_create_box", BridgeMethods.BrushCreateBox, "Create a Block brush. Compatibility wrapper for old box calls.", BrushSchema(), "min", "max"),
                     BrushPreset("brush_create_arch", "Arch", "Create an Arch brush with parameters like numberOfSides, wallWidth, arc, startAngle, addHeight, curvedRamp, tiltAngle, and tiltInterp."),
                     BrushPreset("brush_create_block", "Block", "Create a Block brush."),
@@ -382,9 +596,11 @@ namespace HammerTime.Mcp.Cli
                     BrushPreset("brush_create_text", "Text", "Create a Text brush. Parameters include fontChooser, flattenFactor, and text."),
                     Tool("vertex_subtools_list", BridgeMethods.VertexSubtoolsList, "List Vertex Manipulation Tool subtools: Point manipulation, Point scaling, and Face editing.", Schema()),
                     Tool("vertex_subtool_activate", BridgeMethods.VertexSubtoolActivate, "Activate a Vertex Manipulation Tool subtool by name or alias, such as point, scale, or face.", Schema(("name", "string", "Vertex subtool name or alias."), ("activateVertexTool", "boolean", "Activate Vertex Manipulation Tool first.")), "name"),
+                    Tool("texture_preview_sheet", BridgeMethods.TexturePreviewSheet, "Render texture candidates into a labeled preview sheet image so the AI can visually inspect options.", Schema(("textures", "array", "Texture names or objects with a name field."), ("query", "string", "Optional texture search text."), ("max", "integer", "Maximum textures per page."), ("tileSize", "integer", "Preview tile size in pixels."), ("columns", "integer", "Preview sheet column count."), ("offset", "integer", "Start index into the candidate list for pagination. Defaults to 0."), ("page", "integer", "Zero-based page (offset = page*max) used when offset is omitted."), ("showDimensions", "boolean", "Draw texture dimensions and semantic-flag glyphs on each tile. Defaults to true."))),
+                    Tool("texture_browser_capture", BridgeMethods.TexturePreviewSheet, "Render texture-browser-style candidates into a labeled preview sheet image.", Schema(("textures", "array", "Texture names or objects with a name field."), ("query", "string", "Optional texture search text."), ("max", "integer", "Maximum textures per page."), ("tileSize", "integer", "Preview tile size in pixels."), ("columns", "integer", "Preview sheet column count."), ("offset", "integer", "Start index into the candidate list for pagination. Defaults to 0."), ("page", "integer", "Zero-based page (offset = page*max) used when offset is omitted."), ("showDimensions", "boolean", "Draw texture dimensions and semantic-flag glyphs on each tile. Defaults to true."))),
                     Tool("objects_delete", BridgeMethods.ObjectsDelete, "Delete map objects by ID.", Schema(("ids", "array", "Object IDs.")), "ids"),
                     Tool("objects_transform", BridgeMethods.ObjectsTransform, "Translate, rotate, or scale objects.", Schema(("ids", "array", "Object IDs."), ("translation", "object", "Vector {x,y,z}."), ("rotationDegrees", "object", "Euler degrees {x,y,z}."), ("scale", "object", "Scale vector {x,y,z}."), ("pivot", "object", "Transform pivot.")), "ids"),
-                    Tool("problems_check", BridgeMethods.ProblemsCheck, "Run HammerTime map problem checks.", Schema()),
+                    Tool("problems_check", BridgeMethods.ProblemsCheck, "Run HammerTime map problem checks.", Schema(("selectedOnly", "boolean", "Only check currently selected objects."))),
                     Tool("problems_fix", BridgeMethods.ProblemsFix, "Fix one problem reported by problems_check.", Schema(("checker", "string", "Checker full type/name."), ("index", "integer", "Problem index from checker.")), "checker"),
                     Tool("leaks_load_pointfile", BridgeMethods.LeaksLoadPointfile, "Load a .lin/.pts pointfile, focus the leak path, and report intersecting objects.", Schema(("path", "string", "Pointfile path."), ("text", "string", "Pointfile text."))),
                     Tool("overlay_set", BridgeMethods.OverlaySet, "Highlight object IDs in HammerTime viewports.", Schema(("ids", "array", "Object IDs."), ("label", "string", "Overlay label.")), "ids"),
@@ -401,7 +617,214 @@ namespace HammerTime.Mcp.Cli
                 foreach (var entry in McpToolCatalog.CreateAll())
                 {
                     if (existing.Contains(entry.Name)) continue;
-                    tools.Add(Tool(entry.Name, entry.BridgeMethod, entry.Description, Schema()));
+                    tools.Add(Tool(entry.Name, entry.BridgeMethod, entry.Description, SchemaForCatalogTool(entry.Name)));
+                }
+            }
+
+            private static JObject SchemaForCatalogTool(string name)
+            {
+                switch (name)
+                {
+                    case "texture_project":
+                        return WithEnum(WithEnum(Schema(
+                            ("ids", "array", "Object IDs. Uses selected faces when omitted."),
+                            ("objectId", "integer", "Single object ID when targeting one face."),
+                            ("faceId", "integer", "Single face ID when targeting one face."),
+                            ("faceIds", "array", "Face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."),
+                            ("faceRefs", "array", "Explicit face references with objectId and faceId."),
+                            ("mode", "string", "Projection mode. Defaults to planar."),
+                            ("texture", "string", "Texture name to apply before projection."),
+                            ("scale", "number", "Texture scale. Omit for cylindrical auto-wrap scale."),
+                            ("direction", "object", "Planar projection direction vector."),
+                            ("align", "string", "Planar alignment. Defaults to natural."),
+                            ("axis", "object", "Cylindrical axis vector."),
+                            ("origin", "object", "Cylindrical origin vector."),
+                            ("labels", "integer", "Number of horizontal texture repeats around the cylinder."),
+                            ("centerLabel", "boolean", "Center one repeated label/panel on each cylindrical wrap."),
+                            ("sides", "integer", "Optional faceted-cylinder side count for seamless polygon wrapping."),
+                            ("numberOfSides", "integer", "Alias for sides.")),
+                            "mode", "planar", "cylindrical", "fit", "center"),
+                            "align", "natural", "center", "fit", "left", "right", "top", "bottom");
+                    case "face_texture_set":
+                        return WithEnum(Schema(
+                            ("ids", "array", "Object IDs. Uses selected faces when omitted."),
+                            ("objectId", "integer", "Single object ID when targeting one face."),
+                            ("faceId", "integer", "Single face ID when targeting one face."),
+                            ("faceIds", "array", "Face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."),
+                            ("faceRefs", "array", "Explicit face references with objectId and faceId."),
+                            ("texture", "string", "Texture name."),
+                            ("name", "string", "Alias for texture name."),
+                            ("xScale", "number", "Texture X scale."),
+                            ("yScale", "number", "Texture Y scale."),
+                            ("xShift", "number", "Texture X shift."),
+                            ("yShift", "number", "Texture Y shift."),
+                            ("rotation", "number", "Texture rotation in degrees."),
+                            ("rotationMode", "string", "absolute rotates the axes to the given angle (default); store writes the raw rotation field."),
+                            ("uAxis", "object", "Texture U axis vector {x,y,z}."),
+                            ("vAxis", "object", "Texture V axis vector {x,y,z}.")), "rotationMode", "absolute", "store");
+                    case "vertex_move":
+                        return Schema(
+                            ("ids", "array", "Solid object IDs."),
+                            ("vertexKeys", "array", "Vertex snapshot keys returned by vertex_snapshot."),
+                            ("vertexRefs", "array", "Explicit vertex references with objectId, faceId, and vertexIndex."),
+                            ("delta", "object", "Relative movement vector {x,y,z}."),
+                            ("position", "object", "Absolute destination vector {x,y,z}."));
+                    case "compile_run":
+                        return WithEnum(Schema(
+                            ("profile", "string", "Built-in compile profile. Defaults to full."),
+                            ("steps", "array", "Optional compile step names to restrict the run (such as CSG, BSP, VIS, RAD)."),
+                            ("arguments", "object", "Compile argument overrides keyed by tool name."),
+                            ("useCordonBounds", "boolean", "Compile with current cordon bounds."),
+                            ("workingDirectory", "string", "Working directory for compile tools."),
+                            ("runGame", "boolean", "Launch the game after a successful compile.")),
+                            "profile", "fast", "full", "custom");
+                    case "cordon_set":
+                        return WithRequired(Schema(
+                            ("min", "object", "Cordon minimum corner."),
+                            ("max", "object", "Cordon maximum corner."),
+                            ("enabled", "boolean", "Enable cordon after setting bounds.")),
+                            "min", "max");
+                    case "cordon_enable":
+                        return WithRequired(Schema(("enabled", "boolean", "Enable or disable cordon rendering/export.")), "enabled");
+                    case "compile_log_tail":
+                        return Schema(("runId", "string", "Compile run ID. Uses the most recent run when omitted."), ("count", "integer", "Maximum log lines to return. Defaults to 100."));
+                    case "selection_filter":
+                        return Schema(("type", "string", "Object type filter, such as Solid or Entity."), ("classname", "string", "Entity classname filter."), ("texture", "string", "Keep objects that use this texture on any face."), ("min", "object", "Filter box minimum corner. Requires max."), ("max", "object", "Filter box maximum corner. Requires min."));
+                    case "selection_grow":
+                        return WithEnum(Schema(("mode", "string", "How to grow the selection. Defaults to children.")), "mode", "parents", "children", "siblings");
+                    case "selection_by_bounds":
+                        return WithRequired(WithEnum(Schema(("min", "object", "Selection box minimum corner."), ("max", "object", "Selection box maximum corner."), ("mode", "string", "intersects selects objects whose bounds overlap the box; inside selects only objects fully contained. Defaults to intersects.")), "mode", "intersects", "inside"), "min", "max");
+                    case "texture_apply":
+                        return WithRequired(Schema(("ids", "array", "Object IDs. Uses selection when omitted."), ("objectId", "integer", "Single object ID when targeting one or more faces."), ("faceId", "integer", "Single face ID on objectId."), ("faceIds", "array", "Face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."), ("faceRefs", "array", "Explicit face references with objectId and faceId."), ("texture", "string", "Texture name to apply."), ("textureScale", "number", "Texture scale.")), "texture");
+                    case "texture_replace":
+                        // find/from and replace/to are accepted aliases (the bridge resolves either).
+                        return WithRequired(Schema(("find", "string", "Texture name to replace (alias: from)."), ("from", "string", "Alias for find."), ("replace", "string", "Replacement texture name (alias: to)."), ("to", "string", "Alias for replace."), ("selectedOnly", "boolean", "Limit replacement to the current selection instead of the whole map."), ("ids", "array", "Optional object IDs to limit replacement."), ("align", "boolean", "Realign replaced faces to their normal. Defaults to false so existing alignment is preserved.")), "find", "replace");
+                    case "texture_align_face":
+                        return WithEnum(WithEnum(Schema(("ids", "array", "Object IDs. Uses selected faces when omitted."), ("objectId", "integer", "Single object ID when targeting one or more faces."), ("faceId", "integer", "Single face ID on objectId."), ("faceIds", "array", "Face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."), ("faceRefs", "array", "Explicit face references with objectId and faceId."), ("mode", "string", "world fixes axes to the world axes; face (alias normal) aligns to the face plane; reset also zeroes shift and rotation. Defaults to normal."), ("rotation", "number", "Optional absolute texture rotation in degrees applied after alignment."), ("justify", "string", "Optional justify within the face after alignment. Defaults to none.")), "mode", "world", "face", "normal", "reset"), "justify", "left", "right", "top", "bottom", "center", "fit", "none");
+                    case "texture_copy_from_face":
+                        return Schema(("sourceFace", "object", "Source face reference with objectId and faceId."), ("projected", "boolean", "Project the source alignment across the shared edge (default true); false copies the raw texture axes verbatim."), ("ids", "array", "Target object IDs. Uses selected faces when omitted."), ("objectId", "integer", "Single target object ID when targeting one or more faces."), ("faceId", "integer", "Single target face ID on objectId."), ("faceIds", "array", "Target face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."), ("faceRefs", "array", "Explicit target face references with objectId and faceId."));
+                    case "face_list":
+                    case "face_select":
+                    case "face_delete":
+                        return Schema(("ids", "array", "Object IDs. Uses selection when omitted."), ("objectId", "integer", "Single object ID when targeting one or more faces."), ("faceId", "integer", "Single face ID on objectId."), ("faceIds", "array", "Face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."), ("faceRefs", "array", "Explicit face references with objectId and faceId."));
+                    case "vertex_snapshot":
+                    case "vertex_triangulate":
+                        return Schema(("ids", "array", "Solid object IDs."), ("objectId", "integer", "Single object ID when targeting one or more faces."), ("faceId", "integer", "Single face ID on objectId."), ("faceIds", "array", "Face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."), ("faceRefs", "array", "Explicit face references with objectId and faceId."));
+                    case "vertex_face_edit":
+                        return WithEnum(Schema(("ids", "array", "Solid object IDs."), ("objectId", "integer", "Single object ID when targeting one or more faces."), ("faceId", "integer", "Single face ID on objectId."), ("faceIds", "array", "Face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."), ("faceRefs", "array", "Explicit face references with objectId and faceId."), ("action", "string", "Face edit action. poke fans the face from a center point; triangulate splits it into triangles. Defaults to poke.")), "action", "poke", "triangulate");
+                    case "vertex_split_face":
+                        return WithRequired(Schema(("objectId", "integer", "Object ID."), ("faceId", "integer", "Face ID."), ("vertexIndexA", "integer", "First vertex index. Must be non-adjacent to vertexIndexB."), ("vertexIndexB", "integer", "Second vertex index. Must be non-adjacent to vertexIndexA.")), "objectId", "faceId", "vertexIndexA", "vertexIndexB");
+                    case "clip_preview":
+                    case "clip_apply":
+                    case "clip_split":
+                        return WithEnum(Schema(("ids", "array", "Solid object IDs. Uses selection when omitted."), ("normal", "object", "Clip plane normal vector. Provide with an optional point."), ("point", "object", "Point on the clip plane. Defaults to the origin."), ("point1", "object", "First point of a three-point clip plane."), ("point2", "object", "Second point of a three-point clip plane."), ("point3", "object", "Third point of a three-point clip plane."), ("side", "string", "Which side to keep (clip_apply only; clip_split always keeps both). Defaults to front.")), "side", "front", "back", "both");
+                    case "object_export_maptext":
+                        return Schema(("id", "integer", "Object ID to export. Falls back to ids[0]."), ("ids", "array", "Object IDs; the first is exported when id is omitted."));
+                    case "object_import_maptext":
+                        return WithRequired(Schema(("text", "string", "Hammer .map brush text for a single solid."), ("select", "boolean", "Select the imported object. Defaults to true.")), "text");
+                    case "prefab_create":
+                        return WithRequired(Schema(("library", "string", "Prefab library name or .ol path."), ("index", "integer", "Prefab index within the library. Resolved from name when omitted."), ("name", "string", "Prefab name; used when index is omitted."), ("origin", "object", "Placement origin. Defaults to the world origin.")), "library");
+                    case "prefabs_list":
+                        return Schema(("directory", "string", "Optional prefab directory. Defaults to the bundled prefabs folder."));
+                    case "entity_schema":
+                        return WithRequired(Schema(("classname", "string", "Entity classname to look up in the active FGD.")), "classname");
+                    case "entity_create_from_schema":
+                        return WithRequired(Schema(("classname", "string", "Entity classname to create using FGD defaults."), ("origin", "object", "Placement origin. Defaults to the world origin."), ("properties", "object", "Keyvalues that override FGD defaults."), ("spawnflags", "integer", "Spawn flags."), ("select", "boolean", "Select after creation.")), "classname");
+                    case "texture_search":
+                        return Schema(("query", "string", "Texture search text."), ("text", "string", "Alias for query."), ("max", "integer", "Maximum results. Defaults to 100."), ("groupFrames", "boolean", "Group animation/frame variants under one logical entry by basename. Defaults to true."), ("includeSpecial", "boolean", "Include tool and sky textures. Defaults to true."));
+                    case "textures_list":
+                        return Schema(("max", "integer", "Maximum textures to return. Defaults to 500."), ("detailed", "boolean", "Return per-texture metadata (dimensions, wad, flags, family) instead of plain names. Defaults to false."));
+                    case "history_list":
+                        return Schema(("max", "integer", "Maximum history entries."));
+                    case "brush_create_from_planes":
+                        return WithRequired(Schema(("planes", "array", "At least four plane definitions, each with points or normal/point plus optional texture."), ("texture", "string", "Default texture name for faces without one."), ("select", "boolean", "Select the created brush. Defaults to true.")), "planes");
+                    case "texture_apply_smart":
+                        return WithEnum(Schema(
+                            ("classify", "string", "nearest always assigns each face its best-matching role (default); strict only assigns faces whose best role dot exceeds 0.9 and reports the rest in skippedFaces."),
+                            ("front", "string", "Texture applied to faces whose normal points along frontDirection."),
+                            ("back", "string", "Texture applied to faces opposite frontDirection."),
+                            ("left", "string", "Texture applied to the left faces relative to frontDirection."),
+                            ("right", "string", "Texture applied to the right faces relative to frontDirection."),
+                            ("top", "string", "Texture applied to upward-facing (+Z) faces."),
+                            ("bottom", "string", "Texture applied to downward-facing (-Z) faces."),
+                            ("frontDirection", "object", "Front-facing direction vector. Defaults to -Y (0,-1,0)."),
+                            ("scale", "number", "Uniform texture scale applied to every assigned face."),
+                            ("fit", "boolean", "Fit each texture once across its face."),
+                            ("center", "boolean", "Center each texture on its face."),
+                            ("ids", "array", "Object IDs whose faces are textured. Uses all objects or selected faces when omitted."),
+                            ("objectId", "integer", "Single object ID when targeting one or more faces."),
+                            ("faceId", "integer", "Single face ID on objectId."),
+                            ("faceIds", "array", "Face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."),
+                            ("faceRefs", "array", "Explicit face references with objectId and faceId.")),
+                            "classify", "nearest", "strict");
+                    case "hammertime_doctor":
+                        return ParameterlessSchema();
+                    case "editor_tools_list":
+                        return ParameterlessSchema();
+                    case "compile_profiles_list":
+                        return ParameterlessSchema();
+                    case "map_validate":
+                        return Schema(("selectedOnly", "boolean", "Only validate the current selection instead of the whole map."));
+                    case "map_fix_all_safe":
+                        return DocumentTargetSchema();
+                    case "undo":
+                        return DocumentTargetSchema();
+                    case "redo":
+                        return DocumentTargetSchema();
+                    case "cordon_get":
+                        return DocumentTargetSchema();
+                    case "fgd_entities_list":
+                        return Schema(("type", "string", "Entity class type filter, such as PointClass or SolidClass."), ("query", "string", "Case-insensitive substring to match against entity classnames."));
+                    case "documents_close":
+                        return Schema(
+                            ("path", "string", "Open document path to close. Uses the active document when omitted."),
+                            ("documentIndex", "integer", "Open document index to close. Uses the active document when omitted."),
+                            ("force", "boolean", "Close without prompting to save unsaved changes. Defaults to false (a save prompt may block)."));
+                    case "texture_audit":
+                        return WithEnum(Schema(
+                            ("ids", "array", "Object IDs to audit. Audits the whole map when omitted."),
+                            ("objectId", "integer", "Single object ID when targeting one or more faces."),
+                            ("faceId", "integer", "Single face ID on objectId."),
+                            ("faceIds", "array", "Face IDs on objectId. These are internal faceId values returned by face_list, not list indexes."),
+                            ("faceRefs", "array", "Explicit face references with objectId and faceId."),
+                            ("scaleTolerance", "number", "Fractional tolerance for scale-outlier detection around the reference scale. Defaults to 0.25."),
+                            ("scaleReference", "string", "Compare scales to the median audited scale or to 1.0. Defaults to median."),
+                            ("nonUniformTolerance", "number", "Relative |xScale-yScale| tolerance for non-uniform scale. Defaults to 0.05."),
+                            ("rotationTolerance", "number", "Degrees a rotation may deviate from a 90-degree multiple. Defaults to 0.5."),
+                            ("shiftTolerance", "number", "Tolerance for fractional-shift detection. Defaults to 0.01."),
+                            ("stretchThreshold", "number", "Scale magnitude above which a face counts as stretched. Defaults to 4.0."),
+                            ("maxOffenders", "integer", "Maximum offenders returned. Defaults to 50."),
+                            ("checkCoplanarMismatch", "boolean", "Flag adjacent coplanar faces with different textures. Defaults to true."),
+                            ("checkToolTextures", "boolean", "Flag visible tool textures on world solids. Defaults to true."),
+                            ("checkHiddenFaces", "boolean", "Flag hidden coplanar faces that should be NULL. Defaults to false."),
+                            ("checkPropTextures", "boolean", "On prop-scale solids, flag random-tiling (-N) textures and framed art cropped at scale ~1 (both informational). Defaults to true."),
+                            ("propMaxDimension", "number", "Bounding-box longest edge (units) at or below which a solid is treated as a prop for the prop-texture checks. Defaults to 160.")),
+                            "scaleReference", "median", "one");
+                    case "map_design_audit":
+                    {
+                        var designSchema = Schema(
+                            ("selectedOnly", "boolean", "Audit only the current selection instead of the whole map. Defaults to false."),
+                            ("checks", "array", "Subset of checks to run. Runs all when omitted."),
+                            ("monotonyThreshold", "number", "Texture share above which a map is flagged monotonous. Defaults to 0.6."),
+                            ("microSize", "number", "Bounding-box smallest dimension below which a solid is a micro-brush. Defaults to 1.0."),
+                            ("maxExtent", "number", "World extent limit; objects beyond +/- this are flagged. Defaults to 4096."),
+                            ("cellSize", "number", "Spatial cell size for hotspot/lighting bucketing. Defaults to 1024."),
+                            ("cellFaceThreshold", "integer", "Face count per cell above which a wpoly hotspot is reported. Defaults to 400."),
+                            ("lightRadius", "number", "Light influence radius for possibly-unlit cell detection. Defaults to 768."),
+                            ("includeProblemChecks", "boolean", "Embed HammerTime problem-check results. Defaults to false."),
+                            ("maxOffenders", "integer", "Maximum offenders per check. Defaults to 50."));
+                        if (designSchema["properties"]?["checks"] is JObject checksProp)
+                        {
+                            checksProp["items"] = new JObject
+                            {
+                                ["type"] = "string",
+                                ["enum"] = new JArray("off_grid", "micro_brush", "texture_monotony", "scale_conventions", "unlit", "missing_player_start", "world_extents", "wpoly_hotspots")
+                            };
+                        }
+                        return designSchema;
+                    }
+                    default:
+                        throw new InvalidOperationException($"No input schema defined for catalog tool '{name}'. Add a case in SchemaForCatalogTool.");
                 }
             }
 
@@ -449,14 +872,24 @@ namespace HammerTime.Mcp.Cli
                 var props = new JObject();
                 foreach (var prop in properties)
                 {
-                    var property = new JObject
+                    JObject property;
+                    if (prop.Type == "object" && IsVectorProperty(prop.Name))
                     {
-                        ["type"] = prop.Type,
-                        ["description"] = prop.Description
-                    };
-                    if (prop.Type == "array")
+                        // Vector params accept {x,y,z}; emit an explicit sub-schema so an LLM
+                        // knows the exact shape instead of a bare object.
+                        property = VectorSchema(prop.Description);
+                    }
+                    else
                     {
-                        property["items"] = ArrayItemsSchema(prop.Name);
+                        property = new JObject
+                        {
+                            ["type"] = prop.Type,
+                            ["description"] = prop.Description
+                        };
+                        if (prop.Type == "array")
+                        {
+                            property["items"] = ArrayItemsSchema(prop.Name);
+                        }
                     }
 
                     props[prop.Name] = property;
@@ -470,11 +903,93 @@ namespace HammerTime.Mcp.Cli
                 };
             }
 
+            // Property names that carry an {x,y,z} vector across the plugin handlers. Only
+            // upgraded to VectorSchema when declared with type "object" (e.g. "scale" is a
+            // vector for objects_transform but a plain number for texture tools).
+            private static readonly HashSet<string> VectorPropertyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "min", "max", "origin", "position", "point", "point1", "point2", "point3",
+                "direction", "axis", "center", "normal", "offset", "translation", "translate",
+                "rotate", "rotationDegrees", "scale", "pivot", "delta", "frontDirection",
+                "uAxis", "vAxis", "lookAt", "anglesDegrees"
+            };
+
+            private static bool IsVectorProperty(string name)
+            {
+                return VectorPropertyNames.Contains(name);
+            }
+
+            private static JObject VectorSchema(string description)
+            {
+                return new JObject
+                {
+                    ["type"] = "object",
+                    ["description"] = description,
+                    ["properties"] = new JObject
+                    {
+                        ["x"] = new JObject { ["type"] = "number" },
+                        ["y"] = new JObject { ["type"] = "number" },
+                        ["z"] = new JObject { ["type"] = "number" }
+                    },
+                    ["required"] = new JArray("x", "y", "z")
+                };
+            }
+
+            private static JObject WithEnum(JObject schema, string property, params string[] values)
+            {
+                if (schema?["properties"] is JObject props && props[property] is JObject prop)
+                {
+                    prop["enum"] = new JArray(values);
+                }
+                return schema;
+            }
+
+            private static JObject WithRequired(JObject schema, params string[] names)
+            {
+                if (schema != null && names.Length > 0) schema["required"] = new JArray(names);
+                return schema;
+            }
+
+            private static JObject ParameterlessSchema()
+            {
+                var schema = Schema();
+                schema["description"] = "No parameters.";
+                return schema;
+            }
+
+            private static JObject DocumentTargetSchema()
+            {
+                return Schema(
+                    ("path", "string", "Target open document path. Uses the active document when omitted."),
+                    ("documentIndex", "integer", "Target open document index. Uses the active document when omitted."));
+            }
+
             private static JObject ArrayItemsSchema(string propertyName)
             {
                 if (string.Equals(propertyName, "ids", StringComparison.OrdinalIgnoreCase))
                 {
                     return new JObject { ["type"] = "integer" };
+                }
+
+                if (string.Equals(propertyName, "faceIds", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new JObject { ["type"] = "integer" };
+                }
+
+                if (string.Equals(propertyName, "textures", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new JObject { ["type"] = "string" };
+                }
+
+                if (string.Equals(propertyName, "texts", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new JObject { ["type"] = "string" };
+                }
+
+                if (string.Equals(propertyName, "steps", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(propertyName, "vertexKeys", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new JObject { ["type"] = "string" };
                 }
 
                 return new JObject { ["type"] = "object" };
@@ -492,8 +1007,18 @@ namespace HammerTime.Mcp.Cli
                 var hammerTimeDir = ResolveHammerTimeDirectory(Args.Value(args, "--hammertime-dir", null));
                 var cliPath = Path.GetFullPath(Environment.ProcessPath ?? typeof(Program).Assembly.Location);
                 var projectDir = ResolveProjectDirectory(Args.Value(args, "--project-dir", null));
+                var clients = Args.Csv(args, "--clients", "generic").ToList();
+                if (clients.Any(x => string.Equals(x, "all", StringComparison.OrdinalIgnoreCase)))
+                {
+                    clients = AllClientIds().ToList();
+                }
+                clients = clients.Select(NormalizeClientId).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
                 var config = McpBridgeConfig.LoadOrCreate(null, hammerTimeDir);
                 config.HammerTimeDirectory = hammerTimeDir;
+                var skillInstall = InstallSkill(cliPath, !pluginOnly && clients.Contains("codex", StringComparer.OrdinalIgnoreCase));
+                config.SkillPath = skillInstall.AppDataPath ?? McpBridgeConfig.GetDefaultSkillPath();
+                config.SkillHash = skillInstall.Hash;
                 McpBridgeConfig.Save(McpBridgeConfig.GetDefaultConfigPath(), config);
 
                 var pluginFiles = new List<string>();
@@ -503,17 +1028,11 @@ namespace HammerTime.Mcp.Cli
                     pluginFiles = CopyPluginFiles(hammerTimeDir);
                 }
 
-                var clients = Args.Csv(args, "--clients", "generic");
-                if (clients.Any(x => string.Equals(x, "all", StringComparison.OrdinalIgnoreCase)))
-                {
-                    clients = AllClientIds();
-                }
-
                 var scope = Args.Value(args, "--scope", "user").ToLowerInvariant();
                 var updated = new List<string>();
                 if (!pluginOnly)
                 {
-                    foreach (var client in clients.Select(NormalizeClientId).Distinct())
+                    foreach (var client in clients)
                     {
                         updated.AddRange(InstallClientConfig(client, scope, cliPath, projectDir));
                     }
@@ -523,6 +1042,8 @@ namespace HammerTime.Mcp.Cli
                 Console.WriteLine($"HammerTime directory: {hammerTimeDir}");
                 Console.WriteLine($"Bridge config: {McpBridgeConfig.GetDefaultConfigPath()}");
                 Console.WriteLine($"Pipe: {config.PipeName}");
+                Console.WriteLine($"Skill file: {config.SkillPath} {(string.IsNullOrWhiteSpace(config.SkillHash) ? "(source not found)" : config.SkillHash)}");
+                if (!string.IsNullOrWhiteSpace(skillInstall.CodexPath)) Console.WriteLine($"Codex skill mirror: {skillInstall.CodexPath}");
                 if (scope == "project") Console.WriteLine($"Project config directory: {projectDir}");
                 if (!clientsOnly)
                 {
@@ -623,9 +1144,7 @@ namespace HammerTime.Mcp.Cli
                 var currentId = System.Diagnostics.Process.GetCurrentProcess().Id;
                 return System.Diagnostics.Process.GetProcesses().Where(x =>
                     x.Id != currentId &&
-                    (string.Equals(x.ProcessName, "Hammertime.Editor", StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(x.ProcessName, "HammertimeEditor", StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(x.ProcessName, "Sledge.Editor", StringComparison.OrdinalIgnoreCase)));
+                    EditorProcessNames.Any(name => string.Equals(x.ProcessName, name, StringComparison.OrdinalIgnoreCase)));
             }
 
             private static string SafeWindowTitle(System.Diagnostics.Process process)
@@ -727,6 +1246,66 @@ namespace HammerTime.Mcp.Cli
                     throw new FileNotFoundException($"HammerTime.Mcp.Plugin.dll was not copied to {hammerTimeDir}");
                 }
                 return copied;
+            }
+
+            private static SkillInstallResult InstallSkill(string cliPath, bool copyCodexMirror)
+            {
+                var source = ResolveSkillSourcePath(cliPath);
+                var result = new SkillInstallResult { SourcePath = source, AppDataPath = McpBridgeConfig.GetDefaultSkillPath() };
+                if (!File.Exists(source)) return result;
+
+                CopyFileCreatingDirectory(source, result.AppDataPath);
+                result.Hash = ComputeFileSha256(result.AppDataPath);
+
+                if (copyCodexMirror)
+                {
+                    result.CodexPath = McpBridgeConfig.GetCodexSkillPath();
+                    CopyFileCreatingDirectory(source, result.CodexPath);
+                }
+
+                return result;
+            }
+
+            private static string ResolveSkillSourcePath(string cliPath)
+            {
+                var cliDirectory = Path.GetDirectoryName(Path.GetFullPath(cliPath)) ?? Directory.GetCurrentDirectory();
+                var candidates = new List<string>
+                {
+                    Path.Combine(cliDirectory, "SKILL.md"),
+                    Path.GetFullPath(Path.Combine(cliDirectory, "..", "SKILL.md")),
+                    Path.Combine(AppContext.BaseDirectory, "SKILL.md"),
+                    Path.GetFullPath(Path.Combine(FindRepoRootSafe(), "MCP-Install", "SKILL.md"))
+                };
+
+                return candidates.FirstOrDefault(File.Exists) ?? candidates[0];
+            }
+
+            private static string FindRepoRootSafe()
+            {
+                try
+                {
+                    return FindRepoRoot();
+                }
+                catch
+                {
+                    return Directory.GetCurrentDirectory();
+                }
+            }
+
+            private static void CopyFileCreatingDirectory(string source, string destination)
+            {
+                var directory = Path.GetDirectoryName(destination);
+                if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+                File.Copy(source, destination, true);
+            }
+
+            private static string ComputeFileSha256(string path)
+            {
+                using (var sha = SHA256.Create())
+                using (var stream = File.OpenRead(path))
+                {
+                    return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+                }
             }
 
             private static string ResolvePluginOutputDirectory()
@@ -987,6 +1566,14 @@ namespace HammerTime.Mcp.Cli
                     Name = name;
                     Path = path;
                 }
+            }
+
+            private sealed class SkillInstallResult
+            {
+                public string SourcePath { get; set; }
+                public string AppDataPath { get; set; }
+                public string CodexPath { get; set; }
+                public string Hash { get; set; }
             }
         }
 

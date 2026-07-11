@@ -72,24 +72,28 @@ namespace HammerTime.Mcp.Plugin
         {
             using (stream)
             {
+                // The connection is reused for many lines, so the reader must retain any
+                // bytes buffered past a newline for the next ReadLine call.
+                var reader = new PipeLineReader(stream);
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    var line = await ReadLine(stream, cancellationToken).ConfigureAwait(false);
+                    var line = await reader.ReadLine(cancellationToken).ConfigureAwait(false);
                     if (line == null) break;
 
                     BridgeResponse response;
+                    BridgeRequest request = null;
                     try
                     {
-                        var request = BridgeJson.DeserializeRequest(line);
+                        request = BridgeJson.DeserializeRequest(line);
                         response = await _handler(request).ConfigureAwait(false);
                     }
                     catch (BridgeProtocolException ex)
                     {
-                        response = BridgeResponse.Fail(null, ErrorCodes.InvalidRequest, ex.Message);
+                        response = BridgeResponse.Fail(request?.Id, ErrorCodes.InvalidRequest, ex.Message);
                     }
                     catch (Exception ex)
                     {
-                        response = BridgeResponse.Fail(null, ErrorCodes.EditorUnavailable, ex.Message);
+                        response = BridgeResponse.Fail(request?.Id, ErrorCodes.EditorUnavailable, ex.Message);
                     }
 
                     await WriteLine(stream, BridgeJson.SerializeResponse(response), cancellationToken).ConfigureAwait(false);
@@ -97,21 +101,63 @@ namespace HammerTime.Mcp.Plugin
             }
         }
 
-        private static async Task<string> ReadLine(Stream stream, CancellationToken cancellationToken)
+        // Reads newline-delimited lines from a stream, buffering in 64KB chunks and
+        // retaining any bytes read past a newline for the next call on the same connection.
+        private sealed class PipeLineReader
         {
-            using (var buffer = new MemoryStream())
+            private const int ReadBufferSize = 64 * 1024;
+            private const long MaxLineBytes = 512L * 1024 * 1024;
+
+            private readonly Stream _stream;
+            private readonly byte[] _chunk = new byte[ReadBufferSize];
+            private int _chunkLength;
+            private int _chunkOffset;
+
+            public PipeLineReader(Stream stream)
             {
-                var single = new byte[1];
-                while (!cancellationToken.IsCancellationRequested)
+                _stream = stream;
+            }
+
+            public async Task<string> ReadLine(CancellationToken cancellationToken)
+            {
+                using (var buffer = new MemoryStream())
                 {
-                    var read = await stream.ReadAsync(single, 0, 1, cancellationToken).ConfigureAwait(false);
-                    if (read == 0) return buffer.Length == 0 ? null : Encoding.UTF8.GetString(buffer.ToArray());
-                    if (single[0] == (byte)'\n') return Encoding.UTF8.GetString(buffer.ToArray()).TrimStart('\uFEFF').TrimEnd('\r');
-                    buffer.WriteByte(single[0]);
+                    while (!cancellationToken.IsCancellationRequested)
+                    {
+                        if (_chunkOffset >= _chunkLength)
+                        {
+                            _chunkLength = await _stream.ReadAsync(_chunk, 0, _chunk.Length, cancellationToken).ConfigureAwait(false);
+                            _chunkOffset = 0;
+                            if (_chunkLength == 0)
+                            {
+                                return buffer.Length == 0 ? null : Decode(buffer);
+                            }
+                        }
+
+                        while (_chunkOffset < _chunkLength)
+                        {
+                            var b = _chunk[_chunkOffset++];
+                            if (b == (byte)'\n')
+                            {
+                                return Decode(buffer);
+                            }
+
+                            buffer.WriteByte(b);
+                            if (buffer.Length > MaxLineBytes)
+                            {
+                                throw new IOException($"HammerTime MCP bridge request exceeded {MaxLineBytes} bytes without a newline.");
+                            }
+                        }
+                    }
+
+                    return null;
                 }
             }
 
-            return null;
+            private static string Decode(MemoryStream buffer)
+            {
+                return Encoding.UTF8.GetString(buffer.ToArray()).TrimStart('\uFEFF').TrimEnd('\r');
+            }
         }
 
         private static async Task WriteLine(Stream stream, string line, CancellationToken cancellationToken)

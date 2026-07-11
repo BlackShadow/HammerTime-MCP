@@ -10,27 +10,43 @@ namespace HammerTime.Mcp.Shared
         public static IReadOnlyList<Vector3Dto> Parse(string text)
         {
             var points = new List<Vector3Dto>();
-            if (string.IsNullOrWhiteSpace(text)) return points;
-
-            var lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
-            for (var i = 0; i < lines.Length; i++)
+            if (!string.IsNullOrEmpty(text))
             {
-                var line = lines[i].Trim();
-                if (line.Length == 0 || line.StartsWith("#") || line.StartsWith("//")) continue;
-
-                var parts = line.Replace(',', ' ')
-                    .Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries)
-                    .ToArray();
-
-                if (parts.Length < 3 ||
-                    !TryParse(parts[0], out var x) ||
-                    !TryParse(parts[1], out var y) ||
-                    !TryParse(parts[2], out var z))
+                var lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+                foreach (var raw in lines)
                 {
-                    throw new PointFileParseException(i + 1, $"Malformed pointfile coordinate line {i + 1}: {line}");
-                }
+                    var line = raw.Trim();
+                    if (line.Length == 0 || line.StartsWith("#") || line.StartsWith("//")) continue;
 
-                points.Add(new Vector3Dto(x, y, z));
+                    var parts = line.Replace(',', ' ')
+                        .Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+
+                    // Collect leading numeric tokens. Header/trailer/garbage lines start
+                    // with a non-numeric token and yield fewer than 3 floats, so they are skipped.
+                    var floats = new List<float>();
+                    foreach (var part in parts)
+                    {
+                        if (!TryParse(part, out var value)) break;
+                        floats.Add(value);
+                    }
+
+                    if (floats.Count >= 6)
+                    {
+                        // .lin segment: two endpoints per line.
+                        points.Add(new Vector3Dto(floats[0], floats[1], floats[2]));
+                        points.Add(new Vector3Dto(floats[3], floats[4], floats[5]));
+                    }
+                    else if (floats.Count >= 3)
+                    {
+                        // .pts point: a single coordinate triple.
+                        points.Add(new Vector3Dto(floats[0], floats[1], floats[2]));
+                    }
+                }
+            }
+
+            if (points.Count == 0)
+            {
+                throw new PointFileParseException(0, "No parseable points found in pointfile.");
             }
 
             return points;

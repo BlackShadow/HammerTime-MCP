@@ -6,7 +6,9 @@ namespace HammerTime.Mcp.Shared
         public const string Doctor = "doctor";
 
         public const string DocumentsList = "documents.list";
+        public const string DocumentsNew = "documents.new";
         public const string DocumentsOpen = "documents.open";
+        public const string DocumentsOpenText = "documents.open_text";
         public const string DocumentsActivate = "documents.activate";
         public const string DocumentsSave = "documents.save";
         public const string DocumentsExport = "documents.export";
@@ -20,7 +22,10 @@ namespace HammerTime.Mcp.Shared
         public const string SelectionGrow = "selection.grow";
         public const string SelectionByBounds = "selection.by_bounds";
         public const string ViewportFocus = "viewport.focus";
+        public const string ViewportCapture = "viewport.capture";
         public const string ViewportClearMarks = "viewport.clear_marks";
+        public const string ViewportCameraSet = "viewport.camera_set";
+        public const string ViewportCameraGet = "viewport.camera_get";
 
         public const string EditorToolsList = "editor.tools_list";
         public const string EditorToolActivate = "editor.tool_activate";
@@ -51,10 +56,15 @@ namespace HammerTime.Mcp.Shared
 
         public const string TexturesList = "textures.list";
         public const string TextureSearch = "texture.search";
+        public const string TexturePreviewSheet = "texture.preview_sheet";
         public const string TextureApply = "texture.apply";
         public const string TextureReplace = "texture.replace";
         public const string TextureAlignFace = "texture.align_face";
         public const string TextureCopyFromFace = "texture.copy_from_face";
+        public const string TextureProject = "texture.project";
+        public const string TextureApplySmart = "texture.apply_smart";
+        public const string TextureAudit = "texture.audit";
+        public const string MapDesignAudit = "map.design_audit";
 
         public const string FaceList = "face.list";
         public const string FaceSelect = "face.select";
@@ -62,6 +72,7 @@ namespace HammerTime.Mcp.Shared
         public const string FaceDelete = "face.delete";
         public const string ObjectExportMapText = "object.export_maptext";
         public const string ObjectImportMapText = "object.import_maptext";
+        public const string ObjectImportMapTextBatch = "object.import_maptext_batch";
 
         public const string ClipPreview = "clip.preview";
         public const string ClipApply = "clip.apply";
@@ -93,5 +104,7 @@ namespace HammerTime.Mcp.Shared
         public const string CordonGet = "cordon.get";
         public const string CordonSet = "cordon.set";
         public const string CordonEnable = "cordon.enable";
+
+        public const string SkillGet = "skill.get";
     }
 }

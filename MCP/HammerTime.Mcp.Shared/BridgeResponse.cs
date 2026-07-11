@@ -23,7 +23,7 @@ namespace HammerTime.Mcp.Shared
             {
                 Id = id,
                 Ok = true,
-                Result = result == null ? null : JToken.FromObject(result)
+                Result = result == null ? JValue.CreateNull() : JToken.FromObject(result)
             };
         }
 
