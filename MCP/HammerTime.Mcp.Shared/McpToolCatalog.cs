@@ -100,7 +100,7 @@ namespace HammerTime.Mcp.Shared
                 // Textures
                 Tool("textures_list", BridgeMethods.TexturesList, "List textures from the active environment."),
                 Tool("texture_search", BridgeMethods.TextureSearch, "Search available textures (returns width/height/aspect/flags/family, grouped by animation frames)."),
-                Tool("texture_preview_sheet", BridgeMethods.TexturePreviewSheet, "Render texture candidates into a labeled preview sheet image so the AI can visually inspect options."),
+                Tool("texture_preview_sheet", BridgeMethods.TexturePreviewSheet, "Render texture candidates into a labeled preview sheet image to compare options visually."),
                 Tool("texture_browser_capture", BridgeMethods.TexturePreviewSheet, "Render texture-browser-style candidates into a labeled preview sheet image (same as texture_preview_sheet)."),
                 Tool("texture_apply", BridgeMethods.TextureApply, "Apply a texture to objects or faces."),
                 Tool("texture_replace", BridgeMethods.TextureReplace, "Replace one texture with another on map faces, preserving alignment by default."),

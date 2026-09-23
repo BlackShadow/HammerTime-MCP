@@ -120,22 +120,11 @@ namespace HammerTime.Mcp.Cli
 
         /// <summary>
         /// Read the bridge config without ever creating or rewriting it (the editor plugin and the installer
-        /// own the file). Returns null when it is missing, unreadable, or lacks a pipe name/token.
+        /// own the file). Returns null when it is missing, unreadable, or lacks a token.
         /// </summary>
         private static McpBridgeConfig TryLoadBridgeConfig(string path)
         {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return null;
-                var config = JsonConvert.DeserializeObject<McpBridgeConfig>(File.ReadAllText(path));
-                if (config == null || string.IsNullOrWhiteSpace(config.PipeName) || string.IsNullOrWhiteSpace(config.Token)) return null;
-                if (string.IsNullOrWhiteSpace(config.SkillPath)) config.SkillPath = McpBridgeConfig.GetDefaultSkillPath();
-                return config;
-            }
-            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is JsonException)
-            {
-                return null;
-            }
+            return string.IsNullOrWhiteSpace(path) ? null : McpBridgeConfig.TryLoad(path);
         }
 
         private static string NoConfigReason(string configPath)
@@ -1323,7 +1312,10 @@ namespace HammerTime.Mcp.Cli
                             ("max", "object", "Cordon maximum corner."),
                             ("enabled", "boolean", "Enable cordon after setting bounds. Keeps the current state when omitted.")), "min", "max"));
                     case "cordon_enable":
-                        return DocumentTarget(WithRequired(Schema(("enabled", "boolean", "Enable or disable cordon rendering/export.")), "enabled"));
+                        return DocumentTarget(WithRequired(Schema(
+                            ("enabled", "boolean", "Enable or disable cordon rendering/export."),
+                            ("min", "object", "Optional cordon minimum corner to set at the same time."),
+                            ("max", "object", "Optional cordon maximum corner to set at the same time.")), "enabled"));
 
                     default:
                         throw new InvalidOperationException($"No input schema defined for catalog tool '{name}'. Add a case in SchemaForCatalogTool.");

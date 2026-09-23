@@ -85,6 +85,7 @@ namespace HammerTime.Mcp.Shared
             {
                 case "path":
                 case "documentindex":
+                case "documentid":
                 case "type":
                 case "brushtype":
                 case "min":

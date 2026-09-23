@@ -3588,12 +3588,6 @@ namespace HammerTime.Mcp.Plugin
             return objects.SelectMany(x => x.FindAll()).OfType<Solid>().Where(x => x.Hierarchy.Parent != null).Distinct();
         }
 
-        /// <summary>Every solid inside <paramref name="objects"/> (groups and brush entities contribute their brushes).</summary>
-        private static IEnumerable<Solid> SolidsOf(IEnumerable<IMapObject> objects)
-        {
-            return objects.SelectMany(x => x.FindAll()).OfType<Solid>().Where(x => x.Hierarchy.Parent != null).Distinct();
-        }
-
         /// <summary>
         /// Operations that make <paramref name="targets"/> the selection. Targets already selected stay selected:
         /// the editor's Select drops already-selected objects when it is built, so a plain "deselect everything,

@@ -37,7 +37,7 @@ namespace HammerTime.Mcp.Plugin
             var propMaxDimension = (float)parameters.Optional("propMaxDimension", 160.0);
 
             var warnings = new List<string>();
-            var faces = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: true).ToList();
+            var faces = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: true, out var scope).ToList();
 
             var collection = await doc.Environment.GetTextureCollection().ConfigureAwait(true);
             var allTextureNames = new HashSet<string>(collection.GetAllTextures(), StringComparer.InvariantCultureIgnoreCase);
@@ -382,6 +382,7 @@ namespace HammerTime.Mcp.Plugin
             return ToToken(new
             {
                 faceCount = faces.Count,
+                scope = scope.ToString().ToLowerInvariant(),
                 medianScale = new { x = medianX, y = medianY },
                 gridSpacing,
                 summary,
