@@ -189,11 +189,16 @@ namespace HammerTime.Mcp.Plugin
                     AddIssue(row, "rotation_off_axis");
                 }
 
-                // rotation_axis_mismatch (informational).
-                var expected = new Texture();
-                expected.AlignToNormal(normal);
-                expected.SetRotation(tex.Rotation);
-                if (AngleDegrees(expected.UAxis, tex.UAxis) > 1f || AngleDegrees(expected.VAxis, tex.VAxis) > 1f)
+                // rotation_axis_mismatch (informational): the axes match neither face alignment nor world
+                // alignment (Hammer's default) at the stored rotation.
+                var expectedFace = new Texture();
+                expectedFace.AlignToNormal(normal);
+                expectedFace.SetRotation(tex.Rotation);
+                var expectedWorld = new Texture();
+                TextureAlignment.AlignWorld(expectedWorld, normal);
+                expectedWorld.SetRotation(tex.Rotation);
+                bool Matches(Texture t) => AngleDegrees(t.UAxis, tex.UAxis) <= 1f && AngleDegrees(t.VAxis, tex.VAxis) <= 1f;
+                if (!Matches(expectedFace) && !Matches(expectedWorld))
                 {
                     AddIssue(row, "rotation_axis_mismatch");
                 }
@@ -302,7 +307,8 @@ namespace HammerTime.Mcp.Plugin
                                 var tb = TextureSemantics.Parse(capped[b].Face.Texture.Name);
                                 if (ta.Tool != null || tb.Tool != null) continue;
                                 if (string.Equals(capped[a].Face.Texture.Name, capped[b].Face.Texture.Name, StringComparison.InvariantCultureIgnoreCase)) continue;
-                                if (BoxesTouch(boxes[a], boxes[b], 1f))
+                                // overlapping coplanar faces (z-fighting), not faces that merely meet at an edge
+                                if (BoxesTouch(boxes[a], boxes[b], -1f))
                                 {
                                     if (rowByFace.TryGetValue(capped[a].Face.ID, out var ra)) AddIssue(ra, "coplanar_texture_mismatch");
                                     if (rowByFace.TryGetValue(capped[b].Face.ID, out var rb)) AddIssue(rb, "coplanar_texture_mismatch");
@@ -333,9 +339,11 @@ namespace HammerTime.Mcp.Plugin
                         {
                             var infoA = TextureSemantics.Parse(capped[a].Face.Texture.Name);
                             if (string.Equals(infoA.Basename, "null", StringComparison.InvariantCultureIgnoreCase)) continue;
+                            if (!IsWorldSolid(capped[a].Object)) continue; // a brush entity may move away from the face behind it
                             for (var b = 0; b < capped.Count; b++)
                             {
                                 if (a == b) continue;
+                                if (!IsWorldSolid(capped[b].Object)) continue;
                                 var opposed = Vector3.Dot(capped[a].Face.Plane.Normal, capped[b].Face.Plane.Normal) < -0.9f;
                                 if (!opposed) continue;
                                 if (BoxContains(boxes[b], boxes[a], 1f))
@@ -474,22 +482,30 @@ namespace HammerTime.Mcp.Plugin
             {
                 var histogram = new Dictionary<string, int>();
                 var offenders = new List<JObject>();
+                var fractional = 0;
+                // Offenders sit off the document's grid (fractional coordinates always do).
+                var referenceGrid = gridSpacing.HasValue && gridSpacing.Value >= 1 ? (int)gridSpacing.Value : 1;
                 foreach (var s in solids)
                 {
                     var g = LargestGridGranularity(s);
                     var key = g < 1 ? "fractional" : g.ToString(CultureInfo.InvariantCulture);
                     histogram[key] = histogram.TryGetValue(key, out var c) ? c + 1 : 1;
-                    if (g < 1)
+                    if (g < 1) fractional++;
+                    // Tested against the grid itself: the histogram stops at 64 and a grid need not be a power of two.
+                    if (g < 1 || (g < referenceGrid && !IsOnGrid(s, referenceGrid)))
                     {
-                        offenders.Add(new JObject { ["objectId"] = s.ID, ["granularity"] = "fractional" });
+                        offenders.Add(new JObject { ["objectId"] = s.ID, ["granularity"] = key });
                     }
                 }
+                var offGridSolids = offenders.Count;
                 if (offenders.Count > maxOffenders) { truncated = true; offenders = offenders.Take(maxOffenders).ToList(); }
                 findings["off_grid"] = new JObject
                 {
                     ["gridSpacing"] = gridSpacing,
+                    ["referenceGrid"] = referenceGrid,
                     ["granularityHistogram"] = JObject.FromObject(histogram),
-                    ["fractionalSolids"] = offenders.Count,
+                    ["fractionalSolids"] = fractional,
+                    ["offGridSolids"] = offGridSolids,
                     ["offenders"] = new JArray(offenders)
                 };
             }
@@ -583,13 +599,13 @@ namespace HammerTime.Mcp.Plugin
                 foreach (var kv in upFaces)
                 {
                     if (!downFaces.TryGetValue(kv.Key, out var downs)) continue;
+                    var downBoxes = downs.Select(dn => (Face: dn, Box: XyBox(dn.Face))).ToList();
                     foreach (var up in kv.Value)
                     {
                         var ub = XyBox(up.Face);
-                        foreach (var dn in downs)
+                        foreach (var (dn, db) in downBoxes)
                         {
                             if (dn.Face.Origin.Z <= up.Face.Origin.Z) continue; // ceiling above floor
-                            var db = XyBox(dn.Face);
                             if (!BoxesTouch(ub, db, 0f)) continue;
                             var gap = dn.Face.Origin.Z - up.Face.Origin.Z;
                             if (gap > 0 && gap < 108)
@@ -613,18 +629,20 @@ namespace HammerTime.Mcp.Plugin
             // unlit (heuristic).
             if (Enabled("unlit"))
             {
-                var lightClasses = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "light", "light_spot", "light_environment" };
+                var lightClasses = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "light", "light_spot" };
                 var lightOrigins = new List<Vector3>();
+                var hasSun = false;
                 foreach (var e in entities)
                 {
                     var cn = e.Data.GetOne<EntityData>()?.Name;
-                    if (cn != null && lightClasses.Contains(cn))
+                    if (string.Equals(cn, "light_environment", StringComparison.OrdinalIgnoreCase)) hasSun = true; // lights every sky-facing area, wherever it sits
+                    else if (cn != null && lightClasses.Contains(cn))
                     {
                         lightOrigins.Add(e.Data.GetOne<Origin>()?.Location ?? e.BoundingBox?.Center ?? Vector3.Zero);
                     }
                 }
                 var hasLightTexture = faces.Any(f => TextureSemantics.Parse(f.Face.Texture.Name).LightEmitting);
-                var unlitMap = lightOrigins.Count == 0 && !hasLightTexture;
+                var unlitMap = lightOrigins.Count == 0 && !hasSun && !hasLightTexture;
 
                 var geometryCells = new HashSet<(int, int, int)>();
                 foreach (var fr in faces)
@@ -632,17 +650,24 @@ namespace HammerTime.Mcp.Plugin
                     var c = fr.Face.Origin;
                     geometryCells.Add(((int)Math.Floor(c.X / cellSize), (int)Math.Floor(c.Y / cellSize), (int)Math.Floor(c.Z / cellSize)));
                 }
+                // A cell counts as possibly unlit when no point light is within reach of any part of it (the cell's
+                // half diagonal is added so a light inside a neighbouring cell still counts).
+                var reach = lightRadius + cellSize * 0.866f;
                 var possiblyUnlit = 0;
-                foreach (var cell in geometryCells)
+                if (!hasSun && !hasLightTexture)
                 {
-                    var center = new Vector3((cell.Item1 + 0.5f) * cellSize, (cell.Item2 + 0.5f) * cellSize, (cell.Item3 + 0.5f) * cellSize);
-                    if (!lightOrigins.Any(o => Vector3.Distance(o, center) <= lightRadius)) possiblyUnlit++;
+                    foreach (var cell in geometryCells)
+                    {
+                        var center = new Vector3((cell.Item1 + 0.5f) * cellSize, (cell.Item2 + 0.5f) * cellSize, (cell.Item3 + 0.5f) * cellSize);
+                        if (!lightOrigins.Any(o => Vector3.Distance(o, center) <= reach)) possiblyUnlit++;
+                    }
                 }
                 heuristics.Add("unlit");
                 findings["unlit"] = new JObject
                 {
                     ["heuristic"] = true,
                     ["lightEntityCount"] = lightOrigins.Count,
+                    ["hasLightEnvironment"] = hasSun,
                     ["hasLightEmittingTexture"] = hasLightTexture,
                     ["unlitMap"] = unlitMap,
                     ["possiblyUnlitCells"] = possiblyUnlit
@@ -849,25 +874,29 @@ namespace HammerTime.Mcp.Plugin
         {
             var verts = face.Vertices.ToList();
             if (verts.Count < 3) return 0f;
+            var origin = verts[0]; // measured relative to a vertex: float cross products of far-away absolute coordinates lose the small area
             var sum = Vector3.Zero;
-            for (var i = 0; i < verts.Count; i++)
+            for (var i = 1; i < verts.Count - 1; i++)
             {
-                var a = verts[i];
-                var b = verts[(i + 1) % verts.Count];
-                sum += Vector3.Cross(a, b);
+                sum += Vector3.Cross(verts[i] - origin, verts[i + 1] - origin);
             }
             return sum.Length() / 2f;
         }
 
         private static int LargestGridGranularity(Solid solid)
         {
-            var coords = solid.Faces.SelectMany(f => f.Vertices).SelectMany(v => new[] { v.X, v.Y, v.Z }).ToList();
-            if (coords.Count == 0) return 0;
+            if (!solid.Faces.SelectMany(f => f.Vertices).Any()) return 0;
             foreach (var g in new[] { 64, 32, 16, 8, 4, 2, 1 })
             {
-                if (coords.All(c => Math.Abs(c - (float)Math.Round(c / g) * g) < 0.01f)) return g;
+                if (IsOnGrid(solid, g)) return g;
             }
             return 0; // fractional (g < 1)
+        }
+
+        private static bool IsOnGrid(Solid solid, int grid)
+        {
+            return solid.Faces.SelectMany(f => f.Vertices).SelectMany(v => new[] { v.X, v.Y, v.Z })
+                .All(c => Math.Abs(c - (float)Math.Round(c / grid) * grid) < 0.01f);
         }
 
         private static bool OutsideExtent(Vector3 v, float maxExtent)

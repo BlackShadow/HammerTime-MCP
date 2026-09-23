@@ -90,7 +90,9 @@ namespace HammerTime.Mcp.Plugin
             Oy.Subscribe<string>("Compile:Output", line => AddCompileLog("output", line));
             Oy.Subscribe<string>("Compile:Error", line => AddCompileLog("error", line));
             Oy.Subscribe<string>("Compile:Information", line => AddCompileLog("info", line));
-            _server = new McpNamedPipeServer(_config.PipeName, HandleRequest);
+            // Creating the overlay here subscribes it to document activate/close before any map opens.
+            _overlay.Value.SetActiveDocument(ActiveDocumentOrNull());
+            _server = new McpNamedPipeServer(_config.PipeName, HandleRequest, Log);
             _server.Start();
             return Task.CompletedTask;
         }
@@ -218,7 +220,7 @@ namespace HammerTime.Mcp.Plugin
                 case BridgeMethods.MapFixAllSafe: return await MapFixAllSafe(parameters);
                 case BridgeMethods.LeaksLoadPointfile: return await LeaksLoadPointfile(parameters);
                 case BridgeMethods.OverlaySet: return ToToken(OverlaySet(parameters));
-                case BridgeMethods.OverlayClear: return ToToken(OverlayClear());
+                case BridgeMethods.OverlayClear: return ToToken(OverlayClear(parameters));
                 case BridgeMethods.CompileProfilesList: return ToToken(CompileProfilesList());
                 case BridgeMethods.CompileRun: return await CompileRun(parameters);
                 case BridgeMethods.CompileLogTail: return ToToken(CompileLogTail(parameters));
@@ -957,7 +959,7 @@ namespace HammerTime.Mcp.Plugin
             var clearOverlay = parameters.Optional("clearOverlay", true);
             var selectedCount = doc.Selection.Count;
 
-            if (clearOverlay) _overlay.Value.Clear();
+            if (clearOverlay) _overlay.Value.Clear(doc);
             if (clearSelection && !doc.Selection.IsEmpty)
             {
                 await Perform(doc, new IOperation[] { new Deselect(doc.Selection.ToList()) }, "viewport.clear_marks", false).ConfigureAwait(true);
@@ -1532,7 +1534,7 @@ namespace HammerTime.Mcp.Plugin
                 c => c.Update(c.Document.Map.Root))).ConfigureAwait(true);
 
             var points = LinesToPoints(pointFile.Lines).Select(x => x.ToDto()).ToList();
-            _overlay.Value.SetLeakPath(points, path == null ? "MCP pointfile" : System.IO.Path.GetFileName(path));
+            _overlay.Value.SetLeakPath(doc, points, path == null ? "MCP pointfile" : System.IO.Path.GetFileName(path));
 
             if (pointFile.Lines.Any())
             {
@@ -1560,16 +1562,25 @@ namespace HammerTime.Mcp.Plugin
 
         private object OverlaySet(JObject parameters)
         {
+            var doc = ResolveDocument(parameters, false);
             var ids = parameters.Ids();
             var label = parameters.Optional<string>("label", "MCP overlay");
-            _overlay.Value.SetHighlights(ids, label);
-            return new { overlay = true, highlightedIds = ids };
+            _overlay.Value.SetHighlights(doc, ids, label);
+            return new { overlay = true, highlightedIds = ids, document = DocumentInfo(doc) };
         }
 
-        private object OverlayClear()
+        private object OverlayClear(JObject parameters)
         {
-            _overlay.Value.Clear();
-            return new { overlay = false };
+            // An explicit path/documentIndex clears that document only; otherwise every document is cleared.
+            if (parameters["path"] == null && parameters["documentIndex"] == null)
+            {
+                _overlay.Value.Clear(null);
+                return new { overlay = false };
+            }
+
+            var doc = ResolveDocument(parameters, true);
+            _overlay.Value.Clear(doc);
+            return new { overlay = false, document = DocumentInfo(doc) };
         }
 
         private async Task<JToken> TexturesList(JObject parameters)

@@ -116,6 +116,9 @@ namespace HammerTime.Mcp.Plugin
                                 var dst = IntPtr.Add(data.Scan0, y * data.Stride);
                                 // B8_G8_R8_A8_UNorm rows map 1:1 onto GDI 32bppArgb (BGRA) rows.
                                 Marshal.Copy(src, row, 0, rowBytes);
+                                // The scene texture's alpha is not meaningful (the clear colour leaves it 0);
+                                // force it opaque so encoders never treat the scene as transparent.
+                                for (var a = 3; a < rowBytes; a += 4) row[a] = 255;
                                 Marshal.Copy(row, 0, dst, rowBytes);
                             }
                         }
@@ -152,7 +155,6 @@ namespace HammerTime.Mcp.Plugin
         {
             if (viewport == null || engine == null || maxWaitMs <= 0) return;
 
-            var previousFps = engine.InactiveTargetFps;
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             var count = 0;
             EventHandler<long> handler = (s, frame) =>
@@ -160,16 +162,18 @@ namespace HammerTime.Mcp.Plugin
                 if (Interlocked.Increment(ref count) >= 2) tcs.TrySetResult(true);
             };
 
-            try
+            // The rate is engine-global; overlapping captures share one boost (see InactiveFpsBoost).
+            using (InactiveFpsBoost.Acquire(() => engine.InactiveTargetFps, v => engine.InactiveTargetFps = v, 120))
             {
-                engine.InactiveTargetFps = Math.Max(previousFps, 120);
                 viewport.OnUpdate += handler;
-                await Task.WhenAny(tcs.Task, Task.Delay(maxWaitMs)).ConfigureAwait(false);
-            }
-            finally
-            {
-                viewport.OnUpdate -= handler;
-                engine.InactiveTargetFps = previousFps;
+                try
+                {
+                    await Task.WhenAny(tcs.Task, Task.Delay(maxWaitMs)).ConfigureAwait(false);
+                }
+                finally
+                {
+                    viewport.OnUpdate -= handler;
+                }
             }
         }
 
