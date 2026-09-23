@@ -15,11 +15,11 @@ Before creating or changing geometry:
 
 1. Confirm HammerTime state with `hammertime_status` and `documents_list`.
 2. Read these instructions with `hammertime_skill` when available so the active MCP install and the agent agree on the current map rules.
-3. If the user named an available map, activate it with `documents_activate`. If they asked for a new map, create it with `documents_new`. If they did not, use the active document.
+3. If the user named an available map, activate it with `documents_activate` (by `documentId`, `path` or `documentIndex`; `documents_list` shows every open document). If they asked for a new map, create it with `documents_new`. If they did not, use the active document.
 4. Read the map shape with `map_snapshot`, then sample relevant objects with `map_search`.
 5. Inspect tool capability with `brush_types_list`, `editor_tools_list`, and `vertex_subtools_list` before promising a shaping method. Note the review and inspection tools too — `map_design_audit`, `texture_audit`, `texture_search` (returns width/height/aspect/flags/family), `viewport_camera_set`/`viewport_camera_get`, and `viewport_capture` (with `method`, `renderMode`, `format`) — so you plan verification, not just shaping.
 6. Learn the local visual grammar: worldspawn properties, WAD list, object count, grouped brush modules, common brush entities, trim sizes, light colors, entity keyvalues, and repeated motifs.
-7. Preserve the active document unless the task requires switching. If you inspect a second open map, restore the user's active map afterward.
+7. Preserve the active document unless the task requires switching. Every document-scoped tool accepts `documentId` (or `path`/`documentIndex`) to read or edit another open map for one call without switching tabs; if you do switch to inspect a second map, restore the user's active map afterward. Captures always show the active tab.
 
 Do not assume any study file is open. The following findings were captured from temporary HammerTime study samples while this skill was created; use them as craft guidance, not required inputs.
 
@@ -56,6 +56,21 @@ From the official large outdoor study pass:
 - Outdoor brushwork is paired with control entities. The study sample used large water brushes, ladders, broad clip/monsterclip volumes, transparent/illusionary detail, sounds, sprites, and explosions around the terrain so the huge space stayed readable and playable.
 - Outdoor lighting was simple and directional: several `light_environment` entities shared a consistent sun angle/pitch with low-intensity warm daylight, while local lights were reserved for warnings, machinery, and readable gameplay cues.
 - Fog, sky, and draw-distance choices are part of brush taste. Distant cliffs and dam silhouettes should simplify with range; foreground rock gets stronger silhouette, cleaner collision, and clearer material transitions.
+
+## Editing Semantics
+
+What the editing tools do with documents, targets, hierarchy, history and textures (enforced by the bridge):
+
+- Documents: tools act on the active document unless `documentId`, `path` or `documentIndex` selects another open one for that call (`documents_list` shows them). `leaks_load_pointfile` uses `path` for the pointfile itself, so select its document with `documentId`/`documentIndex`. `viewport_capture`, `viewport_focus` and the camera tools work on the on-screen viewports, which always show the active document.
+- Targets: `ids` may name solids, entities or groups; an entity or group target means its brushes (and, for texture tools, their faces). Tools that reshape or delete (`clip_apply`, `clip_split`, `vertex_move`, `objects_delete`, `objects_transform`) need `ids` or a selection and never fall back to the whole map. Face tools (`texture_*`, `face_*`, `vertex_face_edit`) take `ids`, `objectId` with `faceId`/`faceIds`, `faceRefs`, a selection of objects, or faces picked with `face_select`; their results report the `scope` used.
+- Selection: `selection_set` replaces the selection (`mode:"add"`/`"remove"` adjust it); selecting what is already selected keeps it selected, and `selection_filter`/`selection_grow` keep the original objects.
+- `objects_transform` scales and rotates about the objects' bounds centre unless `pivot` is given (the pivot used is returned); an object named together with its parent moves once; texture lock follows the editor's Texture Lock setting; a zero scale is refused.
+- `clip_apply` keeps the `side` you name (`front` by default) of every solid the plane crosses; `clip_split` keeps both parts. A solid the plane does not cross is left as it is, so use `clip_preview` first to see which solids span the plane.
+- `vertex_move` refuses (`invalid_operation`) a move that would make a face non-planar or the brush non-convex: move every vertex of the affected faces, `vertex_split_face` first, or clip. `face_delete` only removes a face that leaves the brush closed (a degenerate one); use `clip_apply` to reshape.
+- `vertex_face_edit` `action:"poke"` takes `distance` (default 8) for the pushed-out centre vertex. `problems_check` and `problems_fix` share `selectedOnly`, so a problem `index` refers to the same list.
+- `entity_create` makes point entities; a brush-entity class from the FGD (`func_wall`, `trigger_*`, ...) is refused: use `entity_tie_brushes` with `classname`.
+- `undo`/`redo` reverse only the newest change of the document, and only when that change was made through this MCP history; if the user edited the map since, the call is refused rather than corrupting the editor's own undo stack.
+- Vectors are objects (`{"x":0,"y":0,"z":1}`); a three-number array is accepted too.
 
 ## Design Loop
 
@@ -447,7 +462,7 @@ Use grid-first construction:
 - Use 64/128 unit thinking for broad architecture, 16/32 for trims and supports, and 1/2/4 only for final alignment or tiny seams.
 - Keep structural sealing brushes simple, snapped, and thick enough to see mistakes. Do not make seal hulls from decorative brush entities.
 - Prefer native primitives over stepped block approximations: `brush_create_arch` for arches, `brush_create_cylinder` for round columns/turns, `brush_create_pipe` for tubes/rings, `brush_create_torus` only when a true torus is worth the face cost.
-- Prefer `clip_preview`, `clip_apply`, and `clip_split` for clean cuts. Use clipping before vertex manipulation when a plane cut can do the job.
+- Prefer `clip_preview`, `clip_apply`, and `clip_split` for clean cuts. Use clipping before vertex manipulation when a plane cut can do the job. Both need explicit targets (`ids` or a selection).
 - Use vertex manipulation for controlled convex shape changes: slopes, tapered beams, cliff facets, custom trim ends, asymmetric rocks, or one-brush angled corners.
 - Split faces only when the added vertices serve a clear shape. After face splitting or vertex moves, validate immediately.
 - Build ornate round or arched details from several simple convex segments when one custom brush becomes fragile.
@@ -512,7 +527,7 @@ Device props are built from their device art:
 | Create primitives | `brush_create_block`, `brush_create_wedge`, `brush_create_arch`, `brush_create_cylinder`, `brush_create_pipe`, `brush_create_cone`, `brush_create_torus` |
 | Shape geometry | `clip_preview`, `clip_apply`, `clip_split`, `vertex_snapshot`, `vertex_move`, `vertex_split_face`, `vertex_triangulate` |
 | Make brush entities | `entity_tie_brushes`, `entity_untie_brushes`, `entity_update` |
-| Discover textures | `texture_search` (width/height/aspect/flags/family, `groupFrames:true`), `texture_preview_sheet` (paginated `offset`/`page`), `texture_browser_capture` |
+| Discover textures | `texture_search` (width/height/aspect/flags/family, `groupFrames:true`), `texture_preview_sheet` (paginated `offset`/`page`; label glyphs `{` transparent, `~` liquid, `*` light, `+` animated, `-` random tiling, `>` scrolling, `^` sky, `#` tool texture), `texture_browser_capture` |
 | Texture safely | `texture_apply_smart`, `texture_apply`, `texture_project`, `texture_align_face`, `texture_copy_from_face`, `texture_replace`, `face_list`, `face_texture_set` |
 | Review design and texture | `map_design_audit`, `texture_audit` |
 | Validate and show | `viewport_capture`, `viewport_camera_set`, `viewport_camera_get`, `map_validate`, `problems_check`, `selection_set`, `viewport_focus`, `overlay_set` |
@@ -556,7 +571,7 @@ Name conventions:
 - `~` prefix (e.g. `~LIGHT`, `~FIFTIES_LGT`): light-emitting hint. It does not emit by itself — pair it with a texlight entry in the RAD file (or the compile texlight list) so the compiler treats the face as a light source.
 - `+0`..`+9` prefix: animated frame chain. Apply the `+0` frame only; the engine cycles the frames automatically. Do not place individual frames on separate faces.
 - `+A`..`+J` prefix: toggle alternates of an animated texture, switched by `func_button`/trigger state. Apply the base frame; the alternate set swaps on activation.
-- `-0`..`-3` prefix: random tiling. The engine picks a variant per face to break up repetition. Apply the `-0` frame; the others are chosen automatically.
+- `-0`..`-9` prefix: random tiling. The engine picks a variant per face to break up repetition. Apply the `-0` frame; the others are chosen automatically.
 - `!` prefix or a `water`-named texture: liquid volume. Must be a `func_water` or a world water brush, inside a sealed volume, with the proper render setup to behave as water.
 - `scroll`-prefixed textures: scrolling surface. Tie the brush to `func_conveyor` (and set speed) so the texture actually moves.
 - `sky`: skybox faces. Draws the sky and, with a `light_environment` plus a RAD sky entry, emits directional daylight. Keep sky brushes as clean sealing world geometry.
@@ -600,7 +615,7 @@ Texture as part of geometry, not afterthought paint:
 - Start texture scale at 1:1 for GoldSrc materials unless the map already uses a different local convention.
 - Let textures carry cheap visual depth where possible. A well-aligned grate, panel, stripe, crack, or light texture can replace many tiny brushes when the player only needs to read surface intent.
 - Apply image/hero textures to the intended face only. Do not fit a door, panel, sign, poster, or screen texture across every side of a brush.
-- Use `texture_apply_smart` with `objectHint`, `surfaceRole`, and `frontDirection` for props, doors, posters, screens, signs, and panels. It now **requires explicit targets** (`ids`/`faceRefs`/`selection`) and errors instead of retexturing the whole map; angled faces are classified to the nearest role by default. Pass `classify:"strict"` for the old thresholding, which reports `skippedFaces`.
+- Use `texture_apply_smart` with per-role textures (`front`, `back`, `left`, `right`, `top`, `bottom`) and `frontDirection` for props, doors, posters, screens, signs, and panels. It **requires explicit targets** (`ids`/`faceRefs`, or a selection of objects or `face_select`ed faces) and errors instead of retexturing the whole map; angled faces are classified to the nearest role by default. Pass `classify:"strict"` for the old thresholding, which reports `skippedFaces`.
 - Use face alignment for continuity: trims should wrap corners, hallway walls should share a phase, and angled/clipped faces should not look randomly offset.
 - Build brushes to fit important textures when possible, especially doors, panels, lab signage, grates, and trims.
 - Use side/back fallback textures for thin props so they look like objects, not wallpaper slabs.
@@ -614,7 +629,7 @@ Texture as part of geometry, not afterthought paint:
 Alignment tool behaviors (use the tool, not hand math, for these):
 
 - `face_texture_set` `rotation` now **actually rotates the texture axes** (real UV rotation), not metadata. `rotationMode:"store"` is the legacy metadata-only escape hatch.
-- `texture_align_face` takes `mode`: `world` (world-axis projection), `face` (in-plane axes; alias `normal`), or `reset`; plus `justify` (`left`/`right`/`top`/`bottom`/`center`/`fit`) and a `rotation` param. Use `mode:face` to keep art square to an angled surface instead of skewing to world axes.
+- `texture_align_face` takes `mode`: `face` (in-plane axes; alias `normal`, the default), `world` (world-axis projection), or `reset` (face axes with shift and rotation zeroed); plus `justify` (one of `left`/`right`/`top`/`bottom`/`center`/`fit`) and a `rotation` param. Use `mode:face` to keep art square to an angled surface instead of skewing to world axes.
 - `texture_copy_from_face` **projects alignment across non-parallel faces by default** (`projected:true`), wrapping continuously around edges and corners — this is the tool for carrying a trim, band, or panel around a corner. Set `projected:false` for a verbatim copy onto a parallel face.
 - `texture_replace` **preserves alignment by default** (`align:false`); pass `find`/`replace` (aliases `from`/`to`). It swaps the material without disturbing scale, shift, or rotation.
 - `texture_project` `mode:cylindrical` no longer needs an explicit `origin` — it defaults to the solid's center and reports `originUsed`. Supply `origin` only to override.
@@ -693,20 +708,20 @@ Use `texture_project` for reliable first-try alignment instead of guessing shift
 - If you know the apothem `a` instead, use `p = 2 * n * a * tan(pi / n)`.
 - For texture width `w` and desired wrap repeats `t`, set horizontal side scale as `uScale = p / (w * t)`. One repeat uses `t = 1`; two repeated labels or bands use `t = 2`.
 - The per-face U advance should be continuous. Each side face consumes its own edge length along the same unwrapped strip; it must not restart at U = 0.
-- Use `texture_project` with `mode: cylindrical`, the correct long `axis`, and the calculated scale/repeat intent. `origin` defaults to the solid's center (reported as `originUsed`) — supply it only to override. In JACK/Hammer terms, this is the case for seamless wrap across adjacent side faces, not isolated face fitting.
+- Use `texture_project` with `mode: cylindrical` and the correct long `axis`. Omit `scale` and the tool computes the faceted wrap scale itself from the side count (`sides`/`numberOfSides`, inferred from the targeted side faces when omitted) and `labels`; pass `scale` only to override it. `origin` defaults to the solid's center (reported as `originUsed`) — supply it only to override. In JACK/Hammer terms, this is the case for seamless wrap across adjacent side faces, not isolated face fitting.
 - Keep top and bottom caps separate. Cap textures use planar, center, fit, or manual 1:1 alignment; the cylindrical side texture must not smear onto caps.
 - If a large non-seamless logo or warning mark should appear once, do not force it to be the repeated side wrap texture. Use a separate flat label plate/decal face, choose a texture designed for cylindrical wrapping, or accept a deliberate hard seam.
 - Low-sided cylinders will still show faceted lighting and geometry. That is GoldSrc-authentic. The failure to reject is texture discontinuity, not visible polygon facets.
 - Visual rejection test: capture the viewport and reject the result if side artwork restarts on each facet, a band jumps at an edge, a label is split unintentionally, the seam is in the main viewing direction, the repeat count is wrong, or the cap artwork is smeared by side projection.
 
 **Cylindrical mode parameters:**
-- `axis`: the object's long axis (e.g. `[0,0,1]` for a vertical cylinder).
+- `axis`: the object's long axis (e.g. `{x:0,y:0,z:1}` for a vertical cylinder).
 - `origin`: optional; the center point of the cylinder in world space. Defaults to the solid's center (reported as `originUsed`) — supply it only to override the auto-center.
-- `scale`: texture scale. For seamless polygon-side wrapping, calculate it from the faceted perimeter, not from the ideal smooth circle. Use `p / (textureWidth * desiredRepeats)`.
+- `scale`: texture scale. Omitted, it is computed from the faceted perimeter (`p / (textureWidth * labels)`) using `sides`/`numberOfSides` (inferred when omitted); set it only to override.
 - `labels`: how many texture repetitions around the circumference.
-- `centerLabel: true` centers the first label in texture space.
+- `centerLabel` (default true) centers the first label in texture space; pass `false` to start the wrap at the seam.
 
-**Important:** If a newly shipped tool (`texture_project`, `viewport_camera_set`/`viewport_camera_get`, `texture_audit`, `map_design_audit`, `texture_align_face`, `texture_search`, ...) is missing from the MCP tool list, the plugin catalog has not reloaded. Close HammerTime completely and restart it. Do not attempt manual workarounds (per-face shift math, cropped screenshots) unless the tool is confirmed unavailable.
+**Important:** If a tool named here is missing from your MCP tool list, your MCP client is running an older `hammertime-mcp` server: the tool list comes from the `hammertime-mcp serve` process the client spawned, not from the editor. Restart the MCP client so it starts the current server, and restart HammerTime so the plugin matches it (rerun the installer first if you updated the files). Do not attempt manual workarounds (per-face shift math, cropped screenshots) unless the tool is confirmed unavailable.
 
 - Motivate every light. Add a fixture, emissive panel, sprite, window, flame, or machine glow before placing a light entity.
 - Use color temperature to reinforce material and mood: warm utility lights, cold lab fill, green toxic pools, blue moon/sky spill, amber flame.
@@ -737,7 +752,7 @@ Run this loop after risky edits and before final response:
 4. Run `map_design_audit` (grid, scale conventions, texture monotony, lighting, world extents, wpoly hotspots) and `texture_audit` (per-face texture issues, plus the informational prop checks `random_tiling_on_prop` and `prop_texture_crop`) after each build phase; fix offenders by `objectId`/`faceRef` and re-run until clean or intentionally waived. See the Design Review Loop for the full workflow.
 5. For image-like prop textures, inspect `face_list` before capture. Look for accidental defaults: all visible faces still at shift 0/0 on a moved prop, cap/lid textures applied but not centered, sign art on edge/back faces, or side faces that need 90 degree rotation.
 6. Select and focus the result with `selection_set` and `viewport_focus`.
-7. Capture the result with `viewport_capture` after focusing it. Aim the 3D view first with `viewport_camera_set` (position + lookAt) for player-eye, corner-overview, and doorway-sightline framings, and add a `renderMode:"wireframe"` pass to check brush structure and fragmentation. `method:"gpu"` capture works even when the editor window is covered but omits `overlay_set` highlights (use `includeOverlays:true` or another method when marks matter). Inspect the returned image content, not just the structured face data. **Do not approve textures based on `face_list` numbers alone.** If a texture is visibly smeared, repeated on the wrong sides, upside down, too blurry, clipped, origin-shifted, seam-misaligned, or visually mismatched, fix the texture alignment/scale/face targeting before calling it finished.
+7. Capture the result with `viewport_capture` after focusing it. Aim the 3D view with the inline `camera` parameter (or `viewport_camera_set` first; position + lookAt) for player-eye, corner-overview, and doorway-sightline framings, and add a `renderMode:"wireframe"` pass to check brush structure and fragmentation. `method:"gpu"` capture works even when the editor window is covered but omits `overlay_set` highlights (use `includeOverlays:true` or another method when marks matter). Inspect the returned image content, not just the structured face data. **Do not approve textures based on `face_list` numbers alone.** If a texture is visibly smeared, repeated on the wrong sides, upside down, too blurry, clipped, origin-shifted, seam-misaligned, or visually mismatched, fix the texture alignment/scale/face targeting before calling it finished.
 8. Use `texture_preview_sheet` or `texture_browser_capture` before choosing unfamiliar textures. Prefer exact texture names supplied by the user over semantic guesses.
 9. If validation times out on a very large loaded map, report that honestly and use narrower evidence: selected bounds, object snapshots, face lists, targeted problem checks, and viewport captures.
 
@@ -752,8 +767,8 @@ When debugging leaks:
 
 Run this after each build phase, alongside the Validation Loop. It catches design and texture problems the geometry validators miss.
 
-1. **Design audit.** Run `map_design_audit` and read the offenders. It flags `off_grid` (per-brush grid granularity), `micro_brush`/`degenerate_face`, `texture_monotony`, `scale_conventions` (doors 48-64 wide x 96-128 tall, steps <=16, floor-to-ceiling under 108 flagged as a heuristic), `unlit` (map-level and per-cell heuristic), `missing_player_start`, `world_extents` beyond +/-4096, and `wpoly_hotspots` (face-density proxy). Each offender carries `objectIds`.
-2. **Texture audit.** Run `texture_audit` (`ids`/`faceRefs`/`selection`). It returns summary counts plus offenders with `faceRefs` and metrics for `scale_outlier`, `non_uniform_scale`, `rotation_off_axis`, `rotation_axis_mismatch`, `fractional_shift`, `stretched`, `perpendicular_axis`, `coplanar_texture_mismatch`, `tool_texture_visible`, `missing_texture`, and `unknown_dimensions`, plus the informational prop checks `random_tiling_on_prop` (a `-N` random-tiling family on a prop-scale solid) and `prop_texture_crop` (framed art cropped by its face).
+1. **Design audit.** Run `map_design_audit` and read the offenders. It flags `off_grid` (per-brush grid granularity), `micro_brush` (which also lists degenerate faces), `texture_monotony`, `scale_conventions` (doors 48-64 wide x 96-128 tall, steps <=16, floor-to-ceiling under 108 flagged as a heuristic), `unlit` (map-level and per-cell heuristic), `missing_player_start`, `world_extents` beyond +/-4096, and `wpoly_hotspots` (face-density proxy). Each offender carries an `objectId` (degenerate faces add `faceId`); `texture_monotony` is only judged on maps with 50 or more textured faces.
+2. **Texture audit.** Run `texture_audit` (`ids`/`faceRefs`, or a selection of objects or faces; the whole map with neither). It returns summary counts plus offenders with `faceRefs` and metrics for `scale_outlier`, `non_uniform_scale`, `rotation_off_axis`, `rotation_axis_mismatch`, `fractional_shift`, `stretched`, `perpendicular_axis`, `coplanar_texture_mismatch`, `hidden_face_not_null` (with `checkHiddenFaces:true`: a world-brush face fully covered by an opposing world-brush face but not textured NULL), `tool_texture_visible`, `missing_texture`, and `unknown_dimensions`, plus the informational prop checks `random_tiling_on_prop` (a `-N` random-tiling family on a prop-scale solid) and `prop_texture_crop` (framed art cropped by its face).
 3. **Fix by reference.** Address offenders by `faceRef`/`objectId`, then re-run both audits until clean or a finding is intentionally waived. Document every waiver (why the off-grid brush, monotony, or short room is deliberate).
 4. **Visual pass with the camera.** Prefer `viewport_capture` with its inline `camera` parameter (same fields as `viewport_camera_set`) — it applies the pose atomically right before the shot. Prefer this over a separate `viewport_camera_set` + `viewport_capture` pair: editor freelook can move the camera between two calls when the mouse is over a viewport. Standard shots:
    - **Player-eye:** position at floor + 64 units, lookAt the far wall center of each corridor or focal wall. This is what the player actually sees.
@@ -823,11 +838,26 @@ Every space the player enters must stay enterable and traversable. This is manua
 | Too many equal lights | Add visible emitters and compose key/fill/accent lighting. |
 | "Looks complex but reads flat" | Add depth changes, shadow gaps, hierarchy, and one focal idea. |
 | Trusting `face_list` numbers over the viewport | Capture the viewport and visually verify the texture is complete and aligned; numbers only confirm the tool state, not the visual result. |
-| `texture_apply_smart` retexturing the whole map | It now requires targets — pass `ids`/`faceRefs`/`selection`; use `classify:"strict"` (with `skippedFaces`) only for the old angled-face thresholding. |
+| `texture_apply_smart` retexturing the whole map | It now requires targets — pass `ids`/`faceRefs`, or select the objects or faces first; use `classify:"strict"` (with `skippedFaces`) only for the old angled-face thresholding. |
 | `texture_replace` wrecking alignment | It preserves alignment by default (`align:false`) and only swaps the material; pass `find`/`replace`. |
 | Trim or band breaking at a corner | Use `texture_copy_from_face` (`projected:true`) to wrap alignment continuously across the corner, or `texture_align_face` `mode:face` on the angled face. |
 | Rotating a texture had no visible effect | `face_texture_set rotation` now rotates the real UV axes; `rotationMode:"store"` is the legacy metadata-only path. |
-| Skipping design review | Run `map_design_audit` + `texture_audit` each phase, fix by `objectId`/`faceRef`, then do a camera pass with `viewport_camera_set` + `viewport_capture`. |
+| Skipping design review | Run `map_design_audit` + `texture_audit` each phase, fix by `objectId`/`faceRef`, then do a camera pass with `viewport_capture` and inline `camera` poses. |
+
+## Tool Index
+
+- Status: `hammertime_status`, `hammertime_doctor`, `hammertime_skill`.
+- Documents: `documents_list`, `documents_new`, `documents_open`, `documents_open_text`, `documents_activate`, `documents_save`, `documents_export`, `documents_close`.
+- Map queries and validation: `map_snapshot`, `map_search`, `map_validate`, `problems_check`, `problems_fix`, `map_fix_all_safe`, `map_design_audit`, `texture_audit`, `leaks_load_pointfile`.
+- Selection and overlay: `selection_get`, `selection_set`, `selection_filter`, `selection_grow`, `selection_by_bounds`, `overlay_set`, `overlay_clear`, `viewport_clear_marks`.
+- Viewports: `viewport_capture`, `viewport_focus`, `viewport_camera_get`, `viewport_camera_set`.
+- Editor tools: `editor_tools_list`, `editor_tool_activate`, `vertex_subtools_list`, `vertex_subtool_activate`.
+- Entities: `entity_create`, `entity_create_from_schema`, `entity_schema`, `fgd_entities_list`, `entity_update`, `entity_tie_brushes`, `entity_untie_brushes`, `scripted_sequence_list`, `scripted_sequence_upsert`.
+- Brushes: `brush_types_list`, `brush_create`, `brush_create_box`, `brush_create_from_planes`, and the presets `brush_create_block`, `brush_create_arch`, `brush_create_wedge`, `brush_create_cylinder`, `brush_create_barrel`, `brush_create_cone`, `brush_create_pipe`, `brush_create_sphere`, `brush_create_torus`, `brush_create_pyramid`, `brush_create_tetrahedron`, `brush_create_text`.
+- Vertex editing: `vertex_snapshot`, `vertex_move`, `vertex_split_face`, `vertex_triangulate`, `vertex_face_edit`.
+- Textures and faces: `textures_list`, `texture_search`, `texture_preview_sheet`, `texture_browser_capture`, `texture_apply`, `texture_apply_smart`, `texture_replace`, `texture_align_face`, `texture_copy_from_face`, `texture_project`, `face_list`, `face_select`, `face_texture_set`, `face_delete`.
+- Map text and clipping: `object_export_maptext`, `object_import_maptext`, `object_import_maptext_batch`, `clip_preview`, `clip_apply`, `clip_split`.
+- Objects, prefabs, history, cordon, compile: `objects_delete`, `objects_transform`, `prefabs_list`, `prefab_create`, `undo`, `redo`, `history_list`, `cordon_get`, `cordon_set`, `cordon_enable`, `compile_profiles_list`, `compile_run`, `compile_log_tail`.
 
 ## Response Contract
 

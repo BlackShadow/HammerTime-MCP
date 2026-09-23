@@ -12,4 +12,9 @@
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Fallback skill text served when no installed SKILL.md is found. Linked from the single
+         canonical copy in MCP-Install; never copied next to the build output. -->
+    <EmbeddedResource Include="..\MCP-Install\SKILL.md" Link="SKILL.md" LogicalName="HammerTime.Mcp.Cli.SKILL.md" />
+  </ItemGroup>
 </Project>

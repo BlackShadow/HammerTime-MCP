@@ -7,18 +7,25 @@ using Newtonsoft.Json.Linq;
 
 namespace HammerTime.Mcp.Cli
 {
+    /// <summary>
+    /// Turns a bridge result into an MCP tool result: the JSON as a text block plus one image block per image
+    /// found anywhere in it (objects with an <c>image/*</c> mimeType and base64 data). The structured copy
+    /// carries every image as a file path instead of the base64 payload so it stays small.
+    /// </summary>
     public static class McpContentFormatter
     {
         private const string ImageOutputDirectoryEnvironmentVariable = "HAMMERTIME_MCP_IMAGE_OUTPUT_DIR";
         private const int MaxCaptureFiles = 200;
+        private const int PruneEveryWrites = 25;
         private static readonly string[] CaptureImageExtensions = { ".png", ".jpg", ".gif", ".webp", ".bmp" };
-        private static readonly HashSet<string> PrunedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly object PruneLock = new object();
+        private static int _writesSincePrune = PruneEveryWrites; // prune on the first write of the process
 
         public static JObject CreateToolResult(JToken result)
         {
-            var structuredSource = AddImageFilePaths(result);
-            var structured = StripImageData(structuredSource) ?? JValue.CreateNull();
+            var images = new List<(string MimeType, string Data)>();
+            var structured = StructuredCopy(result, images);
+
             var content = new JArray
             {
                 new JObject
@@ -27,19 +34,13 @@ namespace HammerTime.Mcp.Cli
                     ["text"] = structured.ToString(Formatting.Indented)
                 }
             };
-
-            foreach (var image in FindImages(result))
+            foreach (var image in images)
             {
-                var data = image.Value<string>("data");
-                var mimeType = image.Value<string>("mimeType") ?? "image/png";
-                if (string.IsNullOrWhiteSpace(data)) continue;
-                if (!mimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase)) continue;
-
                 content.Add(new JObject
                 {
                     ["type"] = "image",
-                    ["mimeType"] = mimeType,
-                    ["data"] = data
+                    ["mimeType"] = image.MimeType,
+                    ["data"] = image.Data
                 });
             }
 
@@ -50,41 +51,19 @@ namespace HammerTime.Mcp.Cli
             };
         }
 
-        private static JToken AddImageFilePaths(JToken token)
+        /// <summary>
+        /// A copy of the result that is always an object (MCP requires structuredContent to be one), with
+        /// image payloads replaced by file paths. Images found at any depth are collected into <paramref name="images"/>.
+        /// </summary>
+        private static JObject StructuredCopy(JToken result, List<(string MimeType, string Data)> images)
         {
-            if (token == null) return null;
-            var clone = token.DeepClone();
-            AddImageFilePathsInPlace(clone);
-            return clone;
+            var clone = result == null || result.Type == JTokenType.Null ? new JObject() : result.DeepClone();
+            var structured = clone as JObject ?? new JObject { ["value"] = clone };
+            CollectAndStripImages(structured, images);
+            return structured;
         }
 
-        public static JToken StripImageData(JToken token)
-        {
-            if (token == null) return null;
-            var clone = token.DeepClone();
-            StripImageDataInPlace(clone);
-            return clone;
-        }
-
-        private static IEnumerable<JObject> FindImages(JToken token)
-        {
-            if (!(token is JObject obj)) yield break;
-
-            if (obj["image"] is JObject image)
-            {
-                yield return image;
-            }
-
-            if (obj["images"] is JArray images)
-            {
-                foreach (var entry in images.OfType<JObject>())
-                {
-                    yield return entry;
-                }
-            }
-        }
-
-        private static void AddImageFilePathsInPlace(JToken token)
+        private static void CollectAndStripImages(JToken token, List<(string MimeType, string Data)> images)
         {
             if (token is JObject obj)
             {
@@ -92,53 +71,28 @@ namespace HammerTime.Mcp.Cli
                 var data = obj.Value<string>("data");
                 if (!string.IsNullOrWhiteSpace(mimeType) &&
                     mimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) &&
-                    !string.IsNullOrWhiteSpace(data) &&
-                    obj["filePath"] == null)
+                    !string.IsNullOrWhiteSpace(data))
                 {
-                    var filePath = TryWriteImageData(obj.Value<string>("name"), mimeType, data);
-                    if (!string.IsNullOrWhiteSpace(filePath))
+                    images.Add((mimeType, data));
+                    if (obj["filePath"] == null)
                     {
-                        obj["filePath"] = filePath;
+                        var filePath = TryWriteImageData(obj.Value<string>("name"), mimeType, data);
+                        if (!string.IsNullOrWhiteSpace(filePath)) obj["filePath"] = filePath;
                     }
-                }
-
-                foreach (var child in obj.Properties().Select(x => x.Value).ToList())
-                {
-                    AddImageFilePathsInPlace(child);
-                }
-            }
-            else if (token is JArray array)
-            {
-                foreach (var child in array.ToList())
-                {
-                    AddImageFilePathsInPlace(child);
-                }
-            }
-        }
-
-        private static void StripImageDataInPlace(JToken token)
-        {
-            if (token is JObject obj)
-            {
-                var mimeType = obj.Value<string>("mimeType");
-                if (!string.IsNullOrWhiteSpace(mimeType) &&
-                    mimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) &&
-                    obj["data"] != null)
-                {
                     obj.Remove("data");
                     obj["dataOmitted"] = true;
                 }
 
                 foreach (var child in obj.Properties().Select(x => x.Value).ToList())
                 {
-                    StripImageDataInPlace(child);
+                    CollectAndStripImages(child, images);
                 }
             }
             else if (token is JArray array)
             {
                 foreach (var child in array.ToList())
                 {
-                    StripImageDataInPlace(child);
+                    CollectAndStripImages(child, images);
                 }
             }
         }
@@ -168,13 +122,17 @@ namespace HammerTime.Mcp.Cli
             }
         }
 
+        /// <summary>
+        /// Keep the newest <see cref="MaxCaptureFiles"/> images. Checked on the first write and then every
+        /// <see cref="PruneEveryWrites"/> writes, so a long-running server does not grow the directory unbounded
+        /// but also does not rescan it on every capture.
+        /// </summary>
         private static void PruneCaptureDirectory(string directory)
         {
-            // Prune each directory at most once per process run to avoid rescanning on
-            // every capture. Register before pruning so a failure does not force retries.
             lock (PruneLock)
             {
-                if (!PrunedDirectories.Add(directory)) return;
+                if (++_writesSincePrune < PruneEveryWrites) return;
+                _writesSincePrune = 0;
             }
 
             try
