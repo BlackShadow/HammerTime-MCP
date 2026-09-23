@@ -58,48 +58,49 @@ namespace HammerTime.Mcp.Shared
                 return info;
             }
 
-            // Prefix conventions (stripped to form the basename).
-            var first = work[0];
-            if (first == '{')
-            {
-                info.Transparent = true;
-                work = work.Substring(1);
-            }
-            else if (first == '!')
-            {
-                info.Liquid = true;
-                work = work.Substring(1);
-            }
-            else if (first == '~')
-            {
-                info.LightEmitting = true;
-                work = work.Substring(1);
-            }
-            else if (first == '+' && work.Length >= 2)
+            // Prefix conventions (stripped to form the basename). An animation/random-tiling prefix can be
+            // followed by a render prefix: "+0~LIGHT" is an animated light texture, "+A{GRATE" a toggling masked one.
+            if (work.Length >= 2 && (work[0] == '+' || work[0] == '-'))
             {
                 var c = work[1];
-                if (c >= '0' && c <= '9')
+                if (work[0] == '+' && c >= '0' && c <= '9')
                 {
                     info.Animated = true;
                     info.Frame = c - '0';
                     work = work.Substring(2);
                 }
-                else if ((c >= 'A' && c <= 'J') || (c >= 'a' && c <= 'j'))
+                else if (work[0] == '+' && ((c >= 'A' && c <= 'J') || (c >= 'a' && c <= 'j')))
                 {
                     info.Animated = true;
                     info.ToggleFrame = true;
                     info.Frame = char.ToUpperInvariant(c) - 'A';
                     work = work.Substring(2);
                 }
-            }
-            else if (first == '-' && work.Length >= 2)
-            {
-                var c = work[1];
-                if (c >= '0' && c <= '9')
+                else if (work[0] == '-' && c >= '0' && c <= '9')
                 {
                     info.RandomTiling = true;
                     info.Frame = c - '0';
                     work = work.Substring(2);
+                }
+            }
+
+            if (work.Length >= 1)
+            {
+                var first = work[0];
+                if (first == '{')
+                {
+                    info.Transparent = true;
+                    work = work.Substring(1);
+                }
+                else if (first == '!')
+                {
+                    info.Liquid = true;
+                    work = work.Substring(1);
+                }
+                else if (first == '~')
+                {
+                    info.LightEmitting = true;
+                    work = work.Substring(1);
                 }
             }
 

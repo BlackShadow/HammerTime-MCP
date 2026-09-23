@@ -116,6 +116,7 @@ namespace HammerTime.Mcp.Shared
             return string.Concat(SplitWords(value)).ToLowerInvariant();
         }
 
+        /// <summary>Words of a label, snake_case or camelCase identifier ("Number of sides", "wall_width", "numSides" all split into their words).</summary>
         private static IEnumerable<string> SplitWords(string value)
         {
             var current = new StringBuilder();
@@ -123,6 +124,12 @@ namespace HammerTime.Mcp.Shared
             {
                 if (char.IsLetterOrDigit(ch))
                 {
+                    // a lower-to-upper transition inside an identifier starts a new word (numSides -> num, Sides)
+                    if (current.Length > 0 && char.IsUpper(ch) && char.IsLower(current[current.Length - 1]))
+                    {
+                        yield return current.ToString();
+                        current.Clear();
+                    }
                     current.Append(ch);
                 }
                 else if (current.Length > 0)

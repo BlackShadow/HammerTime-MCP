@@ -44,8 +44,9 @@ namespace HammerTime.Mcp.Cli
                         await new McpStdioServer().Run();
                         return 0;
                     case "install":
-                        Installer.Install(rest);
-                        return 0;
+                        return Installer.Install(rest);
+                    case "uninstall":
+                        return Installer.Uninstall(rest);
                     case "config":
                     case "print-config":
                         Installer.PrintConfig(rest);
@@ -171,6 +172,10 @@ namespace HammerTime.Mcp.Cli
             Console.WriteLine("Usage:");
             Console.WriteLine("  hammertime-mcp serve");
             Console.WriteLine("  hammertime-mcp install --hammertime-dir <dir> [--clients generic,claude,claude-code,cursor,codex,vscode,vscode-insiders,windsurf,kimi-code,opencode,antigravity,antigravity-cli,gemini-cli,all] [--scope project|user] [--project-dir <dir>]");
+            Console.WriteLine("                         [--plugin-only | --clients-only] [--allow-running]");
+            Console.WriteLine("  hammertime-mcp uninstall [--clients ...] [--scope project|user] [--project-dir <dir>] [--remove-skill]");
+            Console.WriteLine("      Removes only the hammertime entry from each client config; --remove-skill also deletes the installed skill file and its Codex mirror.");
+            Console.WriteLine("  hammertime-mcp list-clients [--scope project|user] [--project-dir <dir>]");
             Console.WriteLine("  hammertime-mcp config");
             Console.WriteLine("  hammertime-mcp status");
             Console.WriteLine("  hammertime-mcp doctor");
@@ -1583,25 +1588,26 @@ namespace HammerTime.Mcp.Cli
 
         private static class Installer
         {
-            public static void Install(string[] args)
+            private const string TomlBegin = "# HammerTime MCP BEGIN";
+            private const string TomlEnd = "# HammerTime MCP END";
+            private const string TomlTable = "mcp_servers." + ServerName;
+
+            /// <summary>Returns the exit code: non-zero when any client config could not be written (the others still are).</summary>
+            public static int Install(string[] args)
             {
                 var pluginOnly = Args.Has(args, "--plugin-only");
                 var clientsOnly = Args.Has(args, "--clients-only");
                 if (pluginOnly && clientsOnly) throw new InvalidOperationException("--plugin-only and --clients-only cannot be used together.");
 
+                var scope = ResolveScope(args);
+                var clients = ResolveClients(args);
                 var hammerTimeDir = ResolveHammerTimeDirectory(Args.Value(args, "--hammertime-dir", null));
-                var cliPath = Path.GetFullPath(Environment.ProcessPath ?? typeof(Program).Assembly.Location);
+                var server = ResolveServerCommand();
                 var projectDir = ResolveProjectDirectory(Args.Value(args, "--project-dir", null));
-                var clients = Args.Csv(args, "--clients", "generic").ToList();
-                if (clients.Any(x => string.Equals(x, "all", StringComparison.OrdinalIgnoreCase)))
-                {
-                    clients = AllClientIds().ToList();
-                }
-                clients = clients.Select(NormalizeClientId).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
                 var config = McpBridgeConfig.LoadOrCreate(null, hammerTimeDir);
                 config.HammerTimeDirectory = hammerTimeDir;
-                var skillInstall = InstallSkill(cliPath, !pluginOnly && clients.Contains("codex", StringComparer.OrdinalIgnoreCase));
+                var skillInstall = InstallSkill(server.ProgramPath, !pluginOnly && clients.Contains("codex", StringComparer.OrdinalIgnoreCase));
                 config.SkillPath = skillInstall.AppDataPath ?? McpBridgeConfig.GetDefaultSkillPath();
                 config.SkillHash = skillInstall.Hash;
                 McpBridgeConfig.Save(McpBridgeConfig.GetDefaultConfigPath(), config);
@@ -1613,20 +1619,32 @@ namespace HammerTime.Mcp.Cli
                     pluginFiles = CopyPluginFiles(hammerTimeDir);
                 }
 
-                var scope = Args.Value(args, "--scope", "user").ToLowerInvariant();
+                // One client failing (a hand-edited file, a locked file) must not stop the others.
                 var updated = new List<string>();
+                var failures = new List<(string Client, string Error)>();
                 if (!pluginOnly)
                 {
                     foreach (var client in clients)
                     {
-                        updated.AddRange(InstallClientConfig(client, scope, cliPath, projectDir));
+                        try
+                        {
+                            var file = InstallClientConfig(client, scope, server, projectDir);
+                            // vscode and vscode-insiders (and generic and claude-code) share project files: report each once
+                            if (!updated.Contains(file, StringComparer.OrdinalIgnoreCase)) updated.Add(file);
+                        }
+                        catch (Exception ex)
+                        {
+                            failures.Add((client, ex.Message));
+                        }
                     }
                 }
 
-                Console.WriteLine(pluginOnly ? "HammerTime MCP plugin installed." : clientsOnly ? "HammerTime MCP client configs installed." : "HammerTime MCP installed.");
+                var status = pluginOnly ? "HammerTime MCP plugin installed" : clientsOnly ? "HammerTime MCP client configs installed" : "HammerTime MCP installed";
+                Console.WriteLine(failures.Count == 0 ? status + "." : status + " with errors.");
                 Console.WriteLine($"HammerTime directory: {hammerTimeDir}");
                 Console.WriteLine($"Bridge config: {McpBridgeConfig.GetDefaultConfigPath()}");
                 Console.WriteLine($"Pipe: {config.PipeName}");
+                Console.WriteLine($"Server command: {server.Command} {string.Join(" ", server.Args)}");
                 Console.WriteLine($"Skill file: {config.SkillPath} {(string.IsNullOrWhiteSpace(config.SkillHash) ? "(source not found)" : config.SkillHash)}");
                 if (!string.IsNullOrWhiteSpace(skillInstall.CodexPath)) Console.WriteLine($"Codex skill mirror: {skillInstall.CodexPath}");
                 if (scope == "project") Console.WriteLine($"Project config directory: {projectDir}");
@@ -1637,23 +1655,118 @@ namespace HammerTime.Mcp.Cli
                     Console.WriteLine($"Plugin files copied: {pluginFiles.Count}");
                 }
                 foreach (var file in updated) Console.WriteLine($"Client config updated: {file}");
+                foreach (var failure in failures) Console.Error.WriteLine($"Client {failure.Client} not updated: {failure.Error}");
+                if (failures.Count > 0)
+                {
+                    Console.Error.WriteLine($"{failures.Count} of {clients.Count} client(s) failed. `hammertime-mcp config` prints the entry to add by hand.");
+                }
+                return failures.Count == 0 ? 0 : 1;
+            }
+
+            /// <summary>Remove only the hammertime entry from each client's config; everything else in the files is left alone.</summary>
+            public static int Uninstall(string[] args)
+            {
+                var scope = ResolveScope(args);
+                var clients = ResolveClients(args);
+                var projectDir = ResolveProjectDirectory(Args.Value(args, "--project-dir", null));
+                var failed = 0;
+                foreach (var client in clients)
+                {
+                    try
+                    {
+                        var path = ClientPath(client, scope, projectDir);
+                        var removed = UninstallClientConfig(client, path);
+                        Console.WriteLine(removed ? $"Client config updated: {path}" : $"Nothing to remove for {client} ({path}).");
+                    }
+                    catch (Exception ex)
+                    {
+                        failed++;
+                        Console.Error.WriteLine($"Client {client} not updated: {ex.Message}");
+                    }
+                }
+
+                if (Args.Has(args, "--remove-skill"))
+                {
+                    var removedSkills = 0;
+                    foreach (var path in new[] { McpBridgeConfig.GetDefaultSkillPath(), McpBridgeConfig.GetCodexSkillPath() })
+                    {
+                        if (!File.Exists(path)) continue;
+                        File.Delete(path);
+                        removedSkills++;
+                        Console.WriteLine($"Skill file removed: {path}");
+                    }
+                    if (removedSkills == 0) Console.WriteLine("No skill file to remove.");
+                }
+
+                Console.WriteLine("The plugin, bridge config and token stay in place; rerun install to register the clients again.");
+                return failed == 0 ? 0 : 1;
             }
 
             public static void PrintConfig(string[] args)
             {
-                var cliPath = Path.GetFullPath(Environment.ProcessPath ?? typeof(Program).Assembly.Location);
-                var server = McpServerJson(cliPath);
-                Console.WriteLine(server.ToString(Formatting.Indented));
+                var server = ResolveServerCommand();
+                var root = new JObject
+                {
+                    ["mcpServers"] = new JObject { [ServerName] = McpServerJson(server) }
+                };
+                Console.WriteLine(root.ToString(Formatting.Indented));
             }
 
             public static void ListClients(string[] args)
             {
-                var scope = Args.Value(args, "--scope", "user").ToLowerInvariant();
+                var scope = ResolveScope(args);
                 var projectDir = ResolveProjectDirectory(Args.Value(args, "--project-dir", null));
                 foreach (var candidate in ClientCandidates(scope, projectDir))
                 {
                     Console.WriteLine($"{candidate.Name}: {candidate.Path}");
                 }
+            }
+
+            private static string ResolveScope(string[] args)
+            {
+                var scope = Args.Value(args, "--scope", "user").Trim().ToLowerInvariant();
+                if (scope != "user" && scope != "project") throw new InvalidOperationException($"--scope must be user or project (got '{scope}').");
+                return scope;
+            }
+
+            private static List<string> ResolveClients(string[] args)
+            {
+                var clients = Args.Csv(args, "--clients", "generic").ToList();
+                if (clients.Any(x => string.Equals(x, "all", StringComparison.OrdinalIgnoreCase)))
+                {
+                    clients = AllClientIds().ToList();
+                }
+                clients = clients.Select(NormalizeClientId).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+                // Reject typos before anything is written.
+                var unknown = clients.Where(x => !AllClientIds().Contains(x, StringComparer.OrdinalIgnoreCase)).ToList();
+                if (unknown.Count > 0)
+                {
+                    throw new InvalidOperationException($"Unknown MCP client(s): {string.Join(", ", unknown)}. Known clients: {string.Join(", ", AllClientIds())}, all.");
+                }
+                return clients;
+            }
+
+            /// <summary>
+            /// The command clients must run: this executable with "serve". When started through the dotnet muxer
+            /// (<c>dotnet hammertime-mcp.dll install</c>) the process path is dotnet itself, which needs the entry
+            /// assembly as its first argument (registering <c>dotnet serve</c> would start nothing).
+            /// </summary>
+            private static ServerCommand ResolveServerCommand()
+            {
+                var assemblyPath = typeof(Program).Assembly.Location;
+                var processPath = Environment.ProcessPath;
+                var command = string.IsNullOrWhiteSpace(processPath) ? assemblyPath : processPath;
+                if (string.IsNullOrWhiteSpace(command)) throw new InvalidOperationException("Cannot determine the hammertime-mcp executable to register.");
+                command = Path.GetFullPath(command);
+
+                if (string.Equals(Path.GetFileNameWithoutExtension(command), "dotnet", StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(assemblyPath))
+                {
+                    var assembly = Path.GetFullPath(assemblyPath);
+                    return new ServerCommand(command, new[] { assembly, "serve" }, assembly);
+                }
+                return new ServerCommand(command, new[] { "serve" }, command);
             }
 
             private static string ResolveHammerTimeDirectory(string provided)
@@ -1913,29 +2026,48 @@ namespace HammerTime.Mcp.Cli
                 throw new DirectoryNotFoundException("Could not find built HammerTime.Mcp.Plugin output. Build HammerTime.Mcp.Plugin first.");
             }
 
-            private static IEnumerable<string> InstallClientConfig(string client, string scope, string cliPath, string projectDir)
+            /// <summary>Upsert the server entry for one client and return the file written.</summary>
+            private static string InstallClientConfig(string client, string scope, ServerCommand server, string projectDir)
             {
-                if (client == "codex")
+                var path = ClientPath(client, scope, projectDir);
+                switch (client)
                 {
-                    var path = ClientPath("codex", scope, projectDir);
-                    UpsertTomlServer(path, cliPath);
-                    return new[] { path };
+                    case "codex":
+                        UpsertTomlServer(path, server);
+                        break;
+                    case "opencode":
+                        UpsertOpenCodeServer(path, server);
+                        break;
+                    case "vscode":
+                    case "vscode-insiders":
+                        UpsertJsonServer(path, "servers", server, stdioType: true);
+                        break;
+                    case "claude-code":
+                        UpsertJsonServer(path, "mcpServers", server, stdioType: true);
+                        break;
+                    default:
+                        UpsertJsonServer(path, "mcpServers", server, stdioType: false);
+                        break;
                 }
+                return path;
+            }
 
-                var candidate = ClientCandidates(scope, projectDir).FirstOrDefault(x => x.Name == client);
-                if (candidate == null) throw new InvalidOperationException($"Unknown MCP client '{client}'.");
-
-                if (client == "opencode")
+            /// <summary>Remove the server entry from one client's config. Returns whether anything was removed.</summary>
+            private static bool UninstallClientConfig(string client, string path)
+            {
+                if (!File.Exists(path)) return false;
+                switch (client)
                 {
-                    UpsertOpenCodeServer(candidate.Path, cliPath);
+                    case "codex":
+                        return RemoveTomlServer(path);
+                    case "opencode":
+                        return RemoveJsonServer(path, "mcp");
+                    case "vscode":
+                    case "vscode-insiders":
+                        return RemoveJsonServer(path, "servers");
+                    default:
+                        return RemoveJsonServer(path, "mcpServers");
                 }
-                else
-                {
-                    var vscode = client == "vscode" || client == "vscode-insiders";
-                    var rootProperty = vscode ? "servers" : "mcpServers";
-                    UpsertJsonServer(candidate.Path, rootProperty, cliPath, vscode);
-                }
-                return new[] { candidate.Path };
             }
 
             private static string[] AllClientIds()
@@ -2040,7 +2172,8 @@ namespace HammerTime.Mcp.Cli
                 {
                     case "generic": return Path.Combine(appData, "HammerTime.MCP", "mcp.json");
                     case "claude": return Path.Combine(appData, "Claude", "claude_desktop_config.json");
-                    case "claude-code": return Path.Combine(home, ".mcp.json");
+                    // Claude Code keeps user-scope servers in ~/.claude.json ("claude mcp add --scope user"); .mcp.json is project scope only
+                    case "claude-code": return Path.Combine(home, ".claude.json");
                     case "cursor": return Path.Combine(home, ".cursor", "mcp.json");
                     case "codex": return Path.Combine(home, ".codex", "config.toml");
                     case "vscode": return Path.Combine(appData, "Code", "User", "mcp.json");
@@ -2055,74 +2188,461 @@ namespace HammerTime.Mcp.Cli
                 }
             }
 
-            private static void UpsertJsonServer(string path, string rootProperty, string cliPath, bool vscode)
+            private static void UpsertJsonServer(string path, string rootProperty, ServerCommand server, bool stdioType)
             {
-                var root = File.Exists(path) ? JObject.Parse(File.ReadAllText(path)) : new JObject();
-                var servers = root[rootProperty] as JObject ?? new JObject();
-                servers[ServerName] = vscode
-                    ? new JObject
-                    {
-                        ["type"] = "stdio",
-                        ["command"] = cliPath,
-                        ["args"] = new JArray("serve")
-                    }
-                    : McpServerJson(cliPath);
-                root[rootProperty] = servers;
-                WriteJson(path, root);
-            }
-
-            private static void UpsertOpenCodeServer(string path, string cliPath)
-            {
-                var root = File.Exists(path) ? JObject.Parse(File.ReadAllText(path)) : new JObject();
-                var servers = root["mcp"] as JObject ?? new JObject();
-                servers[ServerName] = new JObject
+                UpdateJsonFile(path, root =>
                 {
-                    ["type"] = "local",
-                    ["command"] = new JArray(cliPath, "serve"),
-                    ["enabled"] = true
-                };
-                root["mcp"] = servers;
-                WriteJson(path, root);
-            }
-
-            private static void UpsertTomlServer(string path, string cliPath)
-            {
-                var existing = File.Exists(path) ? File.ReadAllText(path) : "";
-                const string begin = "# HammerTime MCP BEGIN";
-                const string end = "# HammerTime MCP END";
-                var start = existing.IndexOf(begin, StringComparison.Ordinal);
-                if (start >= 0)
-                {
-                    var finish = existing.IndexOf(end, start, StringComparison.Ordinal);
-                    if (finish >= 0) existing = existing.Remove(start, finish + end.Length - start).TrimEnd();
-                }
-
-                var block = string.Join(Environment.NewLine, new[]
-                {
-                    begin,
-                    "[mcp_servers.hammertime]",
-                    $"command = \"{EscapeToml(cliPath)}\"",
-                    "args = [\"serve\"]",
-                    end
+                    var servers = root[rootProperty] as JObject ?? new JObject();
+                    var entry = McpServerJson(server);
+                    if (stdioType) entry.AddFirst(new JProperty("type", "stdio"));
+                    servers[ServerName] = entry;
+                    root[rootProperty] = servers;
+                    return true;
                 });
-
-                Directory.CreateDirectory(Path.GetDirectoryName(path));
-                File.WriteAllText(path, (existing.TrimEnd() + Environment.NewLine + Environment.NewLine + block + Environment.NewLine).TrimStart());
             }
 
-            private static JObject McpServerJson(string cliPath)
+            private static void UpsertOpenCodeServer(string path, ServerCommand server)
+            {
+                UpdateJsonFile(path, root =>
+                {
+                    var servers = root["mcp"] as JObject ?? new JObject();
+                    var command = new JArray(server.Command);
+                    foreach (var arg in server.Args) command.Add(arg);
+                    servers[ServerName] = new JObject
+                    {
+                        ["type"] = "local",
+                        ["command"] = command,
+                        ["enabled"] = true
+                    };
+                    root["mcp"] = servers;
+                    return true;
+                });
+            }
+
+            private static bool RemoveJsonServer(string path, string rootProperty)
+            {
+                return UpdateJsonFile(path, root =>
+                {
+                    if (!(root[rootProperty] is JObject servers) || servers[ServerName] == null) return false;
+                    servers.Remove(ServerName);
+                    return true;
+                });
+            }
+
+            private static JObject McpServerJson(ServerCommand server)
             {
                 return new JObject
                 {
-                    ["command"] = cliPath,
-                    ["args"] = new JArray("serve")
+                    ["command"] = server.Command,
+                    ["args"] = new JArray(server.Args.Select(x => (JToken)x))
                 };
             }
 
-            private static void WriteJson(string path, JObject root)
+            /// <summary>
+            /// Read-modify-write a client's JSON config. Client files are other programs' state (~/.claude.json is
+            /// rewritten by Claude Code all the time), so the file is re-read right before it is replaced and the
+            /// change is redone when it moved underneath us. Returns false when <paramref name="mutate"/> changed nothing.
+            /// </summary>
+            private static bool UpdateJsonFile(string path, Func<JObject, bool> mutate)
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(path));
-                File.WriteAllText(path, root.ToString(Formatting.Indented));
+                for (var attempt = 0; ; attempt++)
+                {
+                    var original = File.Exists(path) ? File.ReadAllText(path) : null;
+                    var root = ParseClientJson(path, original);
+                    if (!mutate(root)) return false;
+                    var text = root.ToString(Formatting.Indented) + Environment.NewLine;
+
+                    var current = File.Exists(path) ? File.ReadAllText(path) : null;
+                    if (!string.Equals(original, current, StringComparison.Ordinal) && attempt < 3) continue;
+                    WriteTextAtomic(path, text);
+                    return true;
+                }
+            }
+
+            /// <summary>
+            /// Parse a client's config as-is: no date or float reinterpretation (Json.NET would otherwise rewrite ISO
+            /// timestamps and decimals in the user's file). A file with comments (JSONC, common for VS Code) is refused:
+            /// rewriting it would silently drop them.
+            /// </summary>
+            private static JObject ParseClientJson(string path, string text)
+            {
+                if (string.IsNullOrWhiteSpace(text)) return new JObject();
+                if (ContainsJsonComments(text))
+                {
+                    throw new InvalidOperationException($"{path} contains comments, which rewriting it would drop; it was left unchanged. Add the hammertime entry by hand (`hammertime-mcp config` prints it).");
+                }
+
+                try
+                {
+                    try
+                    {
+                        return ParseJson(text, FloatParseHandling.Decimal);
+                    }
+                    catch (JsonReaderException)
+                    {
+                        // a number outside the decimal range: read it as double rather than fail the install,
+                        // unless even a double cannot hold it (it would be written back as "Infinity")
+                        var root = ParseJson(text, FloatParseHandling.Double);
+                        if (root.Descendants().OfType<JValue>().Any(v => v.Value is double d && (double.IsInfinity(d) || double.IsNaN(d))))
+                        {
+                            throw new InvalidOperationException($"{path} contains a number too large to rewrite faithfully; it was left unchanged. Add the hammertime entry by hand (`hammertime-mcp config` prints it).");
+                        }
+                        return root;
+                    }
+                }
+                catch (JsonReaderException ex)
+                {
+                    throw new InvalidOperationException($"{path} is not a valid JSON object ({ex.Message}); it was left unchanged.", ex);
+                }
+            }
+
+            /// <summary>True when the text carries // or /* */ comment tokens (a string containing slashes is not one).</summary>
+            private static bool ContainsJsonComments(string text)
+            {
+                using (var reader = new JsonTextReader(new StringReader(text)) { DateParseHandling = DateParseHandling.None, FloatParseHandling = FloatParseHandling.Double })
+                {
+                    try
+                    {
+                        while (reader.Read())
+                        {
+                            if (reader.TokenType == JsonToken.Comment) return true;
+                        }
+                    }
+                    catch (JsonReaderException)
+                    {
+                        // malformed content: the real parse reports it
+                    }
+                }
+                return false;
+            }
+
+            private static JObject ParseJson(string text, FloatParseHandling floats)
+            {
+                using (var reader = new JsonTextReader(new StringReader(text)) { DateParseHandling = DateParseHandling.None, FloatParseHandling = floats })
+                {
+                    var root = JObject.Load(reader);
+                    // JObject.Load stops after the root object; trailing content would be lost on rewrite
+                    if (reader.Read()) throw new JsonReaderException("Additional text found after the root object.");
+                    return root;
+                }
+            }
+
+            /// <summary>Replace the file atomically: write a temp file next to it, then swap it in.</summary>
+            private static void WriteTextAtomic(string path, string text)
+            {
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                var temp = path + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
+                try
+                {
+                    File.WriteAllText(temp, text, new UTF8Encoding(false));
+                    McpBridgeConfig.ReplaceFile(temp, path);
+                }
+                finally
+                {
+                    try { if (File.Exists(temp)) File.Delete(temp); } catch { /* best effort */ }
+                }
+            }
+
+            private static void UpsertTomlServer(string path, ServerCommand server)
+            {
+                var existing = File.Exists(path) ? File.ReadAllText(path) : "";
+                var newline = existing.Contains("\r\n") || existing.Length == 0 && Environment.NewLine == "\r\n" ? "\r\n" : "\n";
+                var lines = SplitLines(existing);
+                var regions = FindTomlServerRegions(lines, path);
+
+                var args = string.Join(", ", server.Args.Select(x => "\"" + EscapeToml(x) + "\""));
+                var block = new List<string>
+                {
+                    TomlBegin,
+                    "[" + TomlTable + "]",
+                    $"command = \"{EscapeToml(server.Command)}\"",
+                    $"args = [{args}]"
+                };
+
+                if (regions.Count == 0)
+                {
+                    block.Add(TomlEnd);
+                    var text = existing.TrimEnd();
+                    WriteTextAtomic(path, (text.Length == 0 ? "" : text + newline + newline) + string.Join(newline, block) + newline);
+                    return;
+                }
+
+                // An existing table (our marker block, a block whose END marker was lost, or one added by hand)
+                // is replaced in place; keys and sub-tables other than command/args are kept.
+                var kept = new List<string>();
+                var keptSubTables = new List<string>();
+                foreach (var region in regions)
+                {
+                    SplitTomlRegion(lines, region.Start, region.End, kept, keptSubTables);
+                }
+                block.AddRange(TrimBlankLines(kept));
+                var sub = TrimBlankLines(keptSubTables);
+                if (sub.Count > 0)
+                {
+                    block.Add("");
+                    block.AddRange(sub);
+                }
+                block.Add(TomlEnd);
+
+                var output = new List<string>();
+                var index = 0;
+                for (var r = 0; r < regions.Count; r++)
+                {
+                    output.AddRange(lines.Skip(index).Take(regions[r].Start - index));
+                    if (r == 0) output.AddRange(block);
+                    index = regions[r].End;
+                }
+                output.AddRange(lines.Skip(index));
+                WriteTextAtomic(path, string.Join(newline, output).TrimEnd() + newline);
+            }
+
+            private static bool RemoveTomlServer(string path)
+            {
+                var existing = File.ReadAllText(path);
+                var newline = existing.Contains("\r\n") ? "\r\n" : "\n";
+                var lines = SplitLines(existing);
+                var regions = FindTomlServerRegions(lines, path);
+                if (regions.Count == 0) return false;
+
+                var output = new List<string>();
+                var index = 0;
+                foreach (var region in regions)
+                {
+                    output.AddRange(lines.Skip(index).Take(region.Start - index));
+                    index = region.End;
+                    // don't leave a double blank line where the table was
+                    if (output.Count > 0 && output[output.Count - 1].Trim().Length == 0 &&
+                        index < lines.Count && lines[index].Trim().Length == 0)
+                    {
+                        index++;
+                    }
+                }
+                output.AddRange(lines.Skip(index));
+                var text = string.Join(newline, output).Trim();
+                WriteTextAtomic(path, text.Length == 0 ? "" : text + newline);
+                return true;
+            }
+
+            /// <summary>
+            /// Line ranges [Start, End) that define the hammertime server: complete marker blocks, a BEGIN marker
+            /// without END (with the table that follows it), and [mcp_servers.hammertime] tables (plus their
+            /// sub-tables) added by hand.
+            /// </summary>
+            private static List<(int Start, int End)> FindTomlServerRegions(List<string> lines, string path)
+            {
+                var headers = TomlHeaderNames(lines);
+                var regions = new List<(int Start, int End)>();
+                string currentTable = null;
+                for (var i = 0; i < lines.Count; i++)
+                {
+                    var trimmed = lines[i].Trim();
+                    if (headers[i] != null)
+                    {
+                        currentTable = headers[i];
+                    }
+                    else if (trimmed.Length > 0 && !trimmed.StartsWith("#", StringComparison.Ordinal) &&
+                             IsDottedHammerTimeKey(trimmed, currentTable))
+                    {
+                        throw new InvalidOperationException($"{path} defines the {ServerName} server as a dotted key or inline table, which the installer cannot update safely; it was left unchanged. Replace it with a [{TomlTable}] table or edit it by hand.");
+                    }
+
+                    if (trimmed == TomlBegin)
+                    {
+                        var end = -1;
+                        for (var j = i + 1; j < lines.Count; j++)
+                        {
+                            var t = lines[j].Trim();
+                            if (t == TomlEnd) { end = j; break; }
+                            if (t == TomlBegin) break;
+                        }
+
+                        if (end >= 0)
+                        {
+                            regions.Add((i, end + 1));
+                            for (var j = i; j <= end; j++) if (headers[j] != null) currentTable = headers[j];
+                            i = end;
+                            continue;
+                        }
+
+                        // BEGIN without END: take the marker and, when it is next, the hammertime table below it
+                        var next = i + 1;
+                        while (next < lines.Count && (lines[next].Trim().Length == 0 || lines[next].Trim().StartsWith("#", StringComparison.Ordinal))) next++;
+                        if (next < lines.Count && IsHammerTimeTable(headers[next]))
+                        {
+                            var tableEnd = TomlTableEnd(lines, headers, next);
+                            regions.Add((i, tableEnd));
+                            currentTable = headers[next];
+                            i = tableEnd - 1;
+                        }
+                        else
+                        {
+                            regions.Add((i, i + 1));
+                        }
+                        continue;
+                    }
+
+                    if (IsHammerTimeTable(headers[i]))
+                    {
+                        var tableEnd = TomlTableEnd(lines, headers, i);
+                        regions.Add((i, tableEnd));
+                        i = tableEnd - 1;
+                    }
+                }
+                return regions;
+            }
+
+            /// <summary>Split a region into the lines to keep: other keys of the main table, and its sub-tables.</summary>
+            private static void SplitTomlRegion(List<string> lines, int start, int end, List<string> kept, List<string> keptSubTables)
+            {
+                var headers = TomlHeaderNames(lines);
+                var inSubTable = false;
+                var arrayDepth = 0;
+                for (var i = start; i < end; i++)
+                {
+                    var line = lines[i];
+                    var trimmed = line.Trim();
+                    if (arrayDepth > 0)
+                    {
+                        // continuation of a dropped multi-line command/args value
+                        arrayDepth += TomlBracketDelta(line);
+                        continue;
+                    }
+                    if (trimmed == TomlBegin || trimmed == TomlEnd) continue;
+                    if (headers[i] != null)
+                    {
+                        if (string.Equals(headers[i], TomlTable, StringComparison.Ordinal)) { inSubTable = false; continue; }
+                        inSubTable = true;
+                    }
+                    if (inSubTable)
+                    {
+                        keptSubTables.Add(line);
+                        continue;
+                    }
+                    if (TomlKeyIs(trimmed, "command") || TomlKeyIs(trimmed, "args"))
+                    {
+                        arrayDepth = Math.Max(0, TomlBracketDelta(line));
+                        continue;
+                    }
+                    kept.Add(line);
+                }
+            }
+
+            /// <summary>First line after the table starting at <paramref name="header"/> and its own sub-tables (trailing blank/comment lines excluded).</summary>
+            private static int TomlTableEnd(List<string> lines, string[] headers, int header)
+            {
+                var end = header + 1;
+                while (end < lines.Count && (headers[end] == null || IsHammerTimeTable(headers[end]))) end++;
+                // comments and blank lines just above the next table belong to it
+                while (end > header + 1 && (lines[end - 1].Trim().Length == 0 || lines[end - 1].Trim().StartsWith("#", StringComparison.Ordinal)) &&
+                       lines[end - 1].Trim() != TomlEnd)
+                {
+                    end--;
+                }
+                return end;
+            }
+
+            /// <summary>Normalised table name for each header line ([a.b] or [[a.b]]), null for every other line. Multi-line strings are skipped.</summary>
+            private static string[] TomlHeaderNames(List<string> lines)
+            {
+                var names = new string[lines.Count];
+                string openQuote = null;
+                for (var i = 0; i < lines.Count; i++)
+                {
+                    var line = lines[i];
+                    if (openQuote != null)
+                    {
+                        if (CountOccurrences(line, openQuote) % 2 == 1) openQuote = null;
+                        continue;
+                    }
+
+                    var trimmed = line.Trim();
+                    if (trimmed.StartsWith("[", StringComparison.Ordinal))
+                    {
+                        var body = trimmed.TrimStart('[');
+                        var close = body.IndexOf(']');
+                        if (close > 0)
+                        {
+                            names[i] = new string(body.Substring(0, close).Where(ch => !char.IsWhiteSpace(ch) && ch != '"' && ch != '\'').ToArray());
+                        }
+                        continue;
+                    }
+
+                    foreach (var quote in new[] { "\"\"\"", "'''" })
+                    {
+                        if (CountOccurrences(line, quote) % 2 == 1) { openQuote = quote; break; }
+                    }
+                }
+                return names;
+            }
+
+            private static bool IsHammerTimeTable(string name)
+            {
+                return name != null && (name == TomlTable || name.StartsWith(TomlTable + ".", StringComparison.Ordinal));
+            }
+
+            /// <summary>hammertime defined as a dotted key or inline table (under [mcp_servers] or at top level).</summary>
+            private static bool IsDottedHammerTimeKey(string trimmed, string currentTable)
+            {
+                var key = trimmed.Split('=')[0];
+                if (key.Length == trimmed.Length) return false;
+                key = new string(key.Where(ch => !char.IsWhiteSpace(ch) && ch != '"' && ch != '\'').ToArray());
+                if (currentTable == "mcp_servers") return key == ServerName || key.StartsWith(ServerName + ".", StringComparison.Ordinal);
+                if (currentTable == null) return key == TomlTable || key.StartsWith(TomlTable + ".", StringComparison.Ordinal) ||
+                                                  key == "mcp_servers" && trimmed.Contains(ServerName);
+                return false;
+            }
+
+            private static bool TomlKeyIs(string trimmed, string key)
+            {
+                var equals = trimmed.IndexOf('=');
+                if (equals <= 0) return false;
+                var name = trimmed.Substring(0, equals).Trim().Trim('"', '\'');
+                return string.Equals(name, key, StringComparison.Ordinal);
+            }
+
+            /// <summary>Net count of [ minus ] outside strings and comments.</summary>
+            private static int TomlBracketDelta(string line)
+            {
+                var depth = 0;
+                char quote = '\0';
+                for (var i = 0; i < line.Length; i++)
+                {
+                    var ch = line[i];
+                    if (quote != '\0')
+                    {
+                        if (ch == '\\' && quote == '"') i++;
+                        else if (ch == quote) quote = '\0';
+                        continue;
+                    }
+                    if (ch == '#') break;
+                    if (ch == '"' || ch == '\'') quote = ch;
+                    else if (ch == '[') depth++;
+                    else if (ch == ']') depth--;
+                }
+                return depth;
+            }
+
+            private static int CountOccurrences(string text, string value)
+            {
+                var count = 0;
+                for (var i = text.IndexOf(value, StringComparison.Ordinal); i >= 0; i = text.IndexOf(value, i + value.Length, StringComparison.Ordinal)) count++;
+                return count;
+            }
+
+            private static List<string> SplitLines(string text)
+            {
+                if (text.Length == 0) return new List<string>();
+                return text.Replace("\r\n", "\n").Split('\n').ToList();
+            }
+
+            private static List<string> TrimBlankLines(List<string> lines)
+            {
+                var start = 0;
+                var end = lines.Count;
+                while (start < end && lines[start].Trim().Length == 0) start++;
+                while (end > start && lines[end - 1].Trim().Length == 0) end--;
+                return lines.Skip(start).Take(end - start).ToList();
             }
 
             private static string EscapeToml(string value)
@@ -2151,6 +2671,23 @@ namespace HammerTime.Mcp.Cli
                     Name = name;
                     Path = path;
                 }
+            }
+
+            private sealed class ServerCommand
+            {
+                public ServerCommand(string command, string[] args, string programPath)
+                {
+                    Command = command;
+                    Args = args;
+                    ProgramPath = programPath;
+                }
+
+                /// <summary>Executable the clients run (hammertime-mcp.exe, or the dotnet muxer).</summary>
+                public string Command { get; }
+                /// <summary>Arguments after the command ("serve", preceded by the entry assembly for the muxer).</summary>
+                public string[] Args { get; }
+                /// <summary>The hammertime-mcp program itself (the skill file is looked up next to it).</summary>
+                public string ProgramPath { get; }
             }
 
             private sealed class SkillInstallResult

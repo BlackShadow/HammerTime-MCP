@@ -80,7 +80,7 @@ namespace HammerTime.Mcp.Shared
 
             return new FaceTargetRequest(
                 DistinctFaceRefs(faceRefs),
-                ReadLongs(parameters["ids"], "ids").Distinct().ToArray());
+                ReadLongs(parameters["ids"] ?? parameters["objectIds"], "ids").Distinct().ToArray());
         }
 
         private static FaceTargetRef ParseFaceRef(JObject obj)
