@@ -1699,6 +1699,8 @@ namespace HammerTime.Mcp.Plugin
             };
         }
 
+        private const int MaxSheetSide = 4096;
+
         private async Task<JToken> TexturePreviewSheet(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
@@ -1712,10 +1714,16 @@ namespace HammerTime.Mcp.Plugin
             var allNames = ResolveTexturePreviewNames(parameters, collection, query);
             var total = allNames.Count;
 
-            // Pagination: explicit offset wins; otherwise page*max (page default 0).
-            var offset = parameters.Optional<int?>("offset", null) ?? parameters.Optional("page", 0) * max;
+            // Bound the composed image (max*tileSize*columns could otherwise reach 6000+ px a side); the
+            // per-page count shrinks to what fits, so page-based offsets use that count and never skip textures
+            if (columns * tileSize > MaxSheetSide) columns = Math.Max(1, MaxSheetSide / tileSize);
+            var rowsThatFit = Math.Max(1, MaxSheetSide / (tileSize + labelHeight));
+            var pageSize = Math.Min(max, rowsThatFit * columns);
+
+            // Pagination: explicit offset wins; otherwise page*pageSize (page default 0).
+            var offset = parameters.Optional<int?>("offset", null) ?? parameters.Optional("page", 0) * pageSize;
             if (offset < 0) offset = 0;
-            var names = allNames.Skip(offset).Take(max).ToList();
+            var names = allNames.Skip(offset).Take(pageSize).ToList();
 
             var rows = Math.Max(1, (int)Math.Ceiling(names.Count / (double)columns));
             var sheetWidth = columns * tileSize;
@@ -1784,8 +1792,8 @@ namespace HammerTime.Mcp.Plugin
                         DrawMissingTexture(g, missingBrush, borderPen, imageRect);
                     }
 
-                    // Line 1: full name (ellipsised to fit). Line 2: dims + semantic glyphs.
-                    var nameText = FitText(g, name, nameFont, labelWidth);
+                    // Line 1: tile index + name (ellipsised to fit). Line 2: dims + semantic glyphs.
+                    var nameText = FitText(g, (offset + i) + " " + name, nameFont, labelWidth);
                     g.DrawString(nameText, nameFont, labelBrush, x + 2, y + tileSize + 1);
                     if (showDimensions)
                     {
@@ -1797,6 +1805,7 @@ namespace HammerTime.Mcp.Plugin
 
                     tiles.Add(new
                     {
+                        index = offset + i,
                         name,
                         x,
                         y,
@@ -1822,6 +1831,7 @@ namespace HammerTime.Mcp.Plugin
                     returned,
                     hasMore,
                     nextOffset = hasMore ? (int?)(offset + returned) : null,
+                    pageSize,
                     tileSize,
                     columns,
                     textures = tiles,
@@ -1872,8 +1882,7 @@ namespace HammerTime.Mcp.Plugin
         {
             var doc = ResolveDocument(parameters, false);
             var texture = parameters.Required<string>("texture");
-            var faces = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).ToList();
-            if (!faces.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "texture.apply requires ids, faceRefs, or a non-empty selection.");
+            var faces = RequireFaces(doc, parameters, "texture.apply", out var scope);
 
             var align = parameters.Optional("align", true);
             var scale = parameters.Optional<decimal?>("textureScale", null);
@@ -1898,7 +1907,7 @@ namespace HammerTime.Mcp.Plugin
             await Perform(doc, ops, "texture.apply").ConfigureAwait(true);
             EnsureTextureNames(doc, changedFaceRefs, texture);
             var changedFaces = FaceInfos(doc, changedFaceRefs);
-            return ToToken(new { texture, changedFaces = changedFaces.Count, faces = changedFaces, warnings });
+            return ToToken(new { texture, scope = scope.ToString().ToLowerInvariant(), changedFaces = changedFaces.Count, faces = changedFaces, warnings });
         }
 
         private async Task<JToken> TextureReplace(JObject parameters)
@@ -1910,8 +1919,15 @@ namespace HammerTime.Mcp.Plugin
             if (string.IsNullOrWhiteSpace(find)) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "texture.replace requires find (or from).");
             if (string.IsNullOrWhiteSpace(replace)) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "texture.replace requires replace (or to).");
             var selectedOnly = parameters.Optional("selectedOnly", false);
-            var solids = CandidateObjects(doc, selectedOnly ? doc.Selection.Select(x => x.ID).ToArray() : parameters.Ids()).OfType<Solid>().ToList();
+            var solids = selectedOnly
+                ? SolidsOf(doc.Selection).ToList() // an empty selection replaces nothing, it never widens to the map
+                : SolidsOf(CandidateObjects(doc, parameters.Ids())).ToList();
             var matches = solids.SelectMany(s => s.Faces.Where(f => string.Equals(f.Texture.Name, find, StringComparison.InvariantCultureIgnoreCase)).Select(f => new FaceRef(s, f))).ToList();
+            if (matches.Count == 0)
+            {
+                // Nothing to forward: texture.apply must never see an empty target list (it would reject it or widen it)
+                return ToToken(new { find, replace, changedFaces = 0, searchedSolids = solids.Count, alignPreserved = true, warnings = new[] { $"no face in the searched solids uses '{find}'" } });
+            }
             var forwarded = new JObject(parameters)
             {
                 ["texture"] = replace,
@@ -1928,9 +1944,9 @@ namespace HammerTime.Mcp.Plugin
         private async Task<JToken> TextureAlignFace(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
-            var faces = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).ToList();
-            if (!faces.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "texture.align_face requires ids, faceRefs, or selected faces.");
+            var faces = RequireFaces(doc, parameters, "texture.align_face", out var scope);
             var mode = parameters.Optional("mode", "normal").ToLowerInvariant();
+            if (mode != "world" && mode != "face" && mode != "normal" && mode != "reset") throw new BridgeCommandException(ErrorCodes.InvalidRequest, "mode must be world, face (alias normal), or reset.");
             var rotation = parameters.Optional<float?>("rotation", null);
             var justify = parameters.Optional("justify", "none").ToLowerInvariant();
             var warnings = new List<string>();
@@ -1951,6 +1967,8 @@ namespace HammerTime.Mcp.Plugin
                         clone.Texture.XShift = 0;
                         clone.Texture.YShift = 0;
                         clone.Texture.Rotation = 0;
+                        clone.Texture.XScale = 1;
+                        clone.Texture.YScale = 1;
                         break;
                     case "face":
                     case "normal":
@@ -1971,7 +1989,7 @@ namespace HammerTime.Mcp.Plugin
             var changedFaceRefs = FaceTargetRefs(faces);
             await Perform(doc, ops, "texture.align_face").ConfigureAwait(true);
             var changedFaces = FaceInfos(doc, changedFaceRefs);
-            return ToToken(new { alignedFaces = changedFaces.Count, mode, faces = changedFaces, warnings });
+            return ToToken(new { alignedFaces = changedFaces.Count, mode, scope = scope.ToString().ToLowerInvariant(), faces = changedFaces, warnings });
         }
 
         private object FaceList(JObject parameters)
@@ -1994,8 +2012,7 @@ namespace HammerTime.Mcp.Plugin
                 .Where(id => id != 0)
                 .Distinct()
                 .ToArray();
-            var faces = CandidateObjects(doc, objectIds.Any() ? objectIds : null)
-                .OfType<Solid>()
+            var faces = SolidsOf(CandidateObjects(doc, objectIds.Any() ? objectIds : null))
                 .SelectMany(x => x.Faces.Select(f => FaceInfo(x, f)))
                 .Take(max)
                 .ToList();
@@ -2011,8 +2028,7 @@ namespace HammerTime.Mcp.Plugin
                 throw new BridgeCommandException(ErrorCodes.InvalidRequest, "face_select mode must be replace, add, or remove.");
             }
 
-            var refs = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).ToList();
-            if (!refs.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "face_select requires ids, faceRefs, objectId plus faceId/faceIds, or selected faces.");
+            var refs = RequireFaces(doc, parameters, "face_select", out _);
             await MapDocumentOperation.Perform(doc, new TrivialOperation(
                 d =>
                 {
@@ -2041,8 +2057,7 @@ namespace HammerTime.Mcp.Plugin
         private async Task<JToken> FaceTextureSet(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
-            var faces = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).ToList();
-            if (!faces.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "face_texture_set requires ids, faceRefs, or selected faces.");
+            var faces = RequireFaces(doc, parameters, "face_texture_set", out var scope);
 
             var warnings = new List<string>();
             var ops = new List<IOperation>();
@@ -2059,7 +2074,7 @@ namespace HammerTime.Mcp.Plugin
             await Perform(doc, ops, "face.texture_set").ConfigureAwait(true);
             if (!string.IsNullOrWhiteSpace(requestedTexture)) EnsureTextureNames(doc, changedFaceRefs, requestedTexture);
             var changedFaces = FaceInfos(doc, changedFaceRefs);
-            return ToToken(new { changedFaces = changedFaces.Count, faces = changedFaces, warnings });
+            return ToToken(new { changedFaces = changedFaces.Count, scope = scope.ToString().ToLowerInvariant(), faces = changedFaces, warnings });
         }
 
         private async Task<JToken> TextureCopyFromFace(JObject parameters)
@@ -2068,8 +2083,8 @@ namespace HammerTime.Mcp.Plugin
             var sourceToken = parameters["sourceFace"] as JObject;
             if (sourceToken == null) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "texture_copy_from_face requires sourceFace { objectId, faceId }.");
             var source = ResolveFaceRefs(doc, new JArray(sourceToken)).First();
-            var targets = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).Where(x => x.Face.ID != source.Face.ID || x.Object.ID != source.Object.ID).ToList();
-            if (!targets.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "texture_copy_from_face requires target faceRefs, ids, or selected faces.");
+            var targets = RequireFaces(doc, parameters, "texture_copy_from_face", out var scope).Where(x => x.Face.ID != source.Face.ID || x.Object.ID != source.Object.ID).ToList();
+            if (!targets.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "texture_copy_from_face: the only targeted face is the source face.");
 
             var projected = parameters.Optional("projected", true);
             var warnings = new List<string>();
@@ -2105,14 +2120,13 @@ namespace HammerTime.Mcp.Plugin
                 if (i < coplanarList.Count) jt["coplanar"] = coplanarList[i];
                 faceTokens.Add(jt);
             }
-            return ToToken(new { source = FaceInfo(source.Object, source.Face), changedFaces = faceTokens.Count, faces = faceTokens, warnings });
+            return ToToken(new { source = FaceInfo(source.Object, source.Face), scope = scope.ToString().ToLowerInvariant(), changedFaces = faceTokens.Count, faces = faceTokens, warnings });
         }
 
         private async Task<JToken> TextureProject(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
-            var faces = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).ToList();
-            if (!faces.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "texture.project requires ids, faceRefs, or selected faces.");
+            var faces = RequireFaces(doc, parameters, "texture.project", out var scope);
 
             var mode = parameters.Optional("mode", "planar").ToLowerInvariant();
             var texture = parameters.Optional<string>("texture", null);
@@ -2127,12 +2141,11 @@ namespace HammerTime.Mcp.Plugin
 
             var warnings = new List<string>();
             var textureCollection = await doc.Environment.GetTextureCollection().ConfigureAwait(true);
-            int texWidth = 64, texHeight = 64;
-            if (!string.IsNullOrWhiteSpace(texture))
+            // Dimensions of the texture each face ends up with: the requested one, else the face's own
+            var dimsByTexture = new Dictionary<string, (int w, int h)>(StringComparer.InvariantCultureIgnoreCase);
+            foreach (var name in faces.Select(f => texture ?? f.Face.Texture.Name).Where(n => !string.IsNullOrWhiteSpace(n)).Distinct(StringComparer.InvariantCultureIgnoreCase))
             {
-                var dims = await ResolveTextureDims(textureCollection, texture, warnings).ConfigureAwait(true);
-                texWidth = dims.w;
-                texHeight = dims.h;
+                dimsByTexture[name] = await ResolveTextureDims(textureCollection, name, warnings).ConfigureAwait(true);
             }
 
             Vector3? originUsed = null;
@@ -2147,21 +2160,22 @@ namespace HammerTime.Mcp.Plugin
                     clone.Texture.XScale = (float)scale.Value;
                     clone.Texture.YScale = (float)scale.Value;
                 }
+                var (texWidth, texHeight) = dimsByTexture.TryGetValue(clone.Texture.Name ?? "", out var td) ? td : (64, 64);
 
-                var cloud = new Cloud(entry.Face.Vertices);
+                var cloud = new Cloud(entry.Face.Vertices); // the cylindrical wrap still uses the cloud extents
 
                 switch (mode)
                 {
                     case "fit":
                         clone.Texture.AlignToNormal(clone.Plane.Normal);
-                        clone.Texture.FitToPointCloud(texWidth, texHeight, cloud, 1, 1);
+                        TextureAlignment.Justify(clone, clone.Texture, "fit", texWidth, texHeight, warnings);
                         break;
                     case "center":
                         clone.Texture.AlignToNormal(clone.Plane.Normal);
-                        clone.Texture.AlignWithPointCloud(texWidth, texHeight, cloud, BoxAlignMode.Center);
+                        TextureAlignment.Justify(clone, clone.Texture, "center", texWidth, texHeight, warnings);
                         break;
                     case "planar":
-                        ApplyPlanarProjection(clone, parameters, cloud, texWidth, texHeight);
+                        ApplyPlanarProjection(clone, parameters, texWidth, texHeight, warnings);
                         break;
                     case "cylindrical":
                         var sideCount = explicitCylindricalSides;
@@ -2193,16 +2207,20 @@ namespace HammerTime.Mcp.Plugin
             {
                 projectedFaces = changedFaces.Count,
                 mode,
+                scope = scope.ToString().ToLowerInvariant(),
                 faces = changedFaces,
                 originUsed = originUsed?.ToDto(),
                 warnings
             });
         }
 
-        private void ApplyPlanarProjection(Face face, JObject parameters, Cloud cloud, int texWidth, int texHeight)
+        private void ApplyPlanarProjection(Face face, JObject parameters, int texWidth, int texHeight, List<string> warnings)
         {
             var direction = parameters.OptionalVector("direction") ?? Vector3.UnitZ;
+            if (direction.LengthSquared() < 1e-6f) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "direction must be a non-zero vector.");
+            direction = Vector3.Normalize(direction);
             var align = parameters.Optional("align", "natural").ToLowerInvariant();
+            if (!new[] { "natural", "center", "fit", "left", "right", "top", "bottom" }.Contains(align)) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "align must be natural, center, fit, left, right, top or bottom.");
 
             var axis = direction.ClosestAxis();
             var tempV = axis == Vector3.UnitZ ? -Vector3.UnitY : -Vector3.UnitZ;
@@ -2210,32 +2228,16 @@ namespace HammerTime.Mcp.Plugin
             face.Texture.VAxis = face.Texture.UAxis.Cross(direction).Normalise();
             face.Texture.Rotation = 0;
 
-            switch (align)
+            if (align == "natural")
             {
-                case "center":
-                    face.Texture.AlignWithPointCloud(texWidth, texHeight, cloud, BoxAlignMode.Center);
-                    break;
-                case "fit":
-                    face.Texture.FitToPointCloud(texWidth, texHeight, cloud, 1, 1);
-                    break;
-                case "left":
-                    face.Texture.AlignWithPointCloud(texWidth, texHeight, cloud, BoxAlignMode.Left);
-                    break;
-                case "right":
-                    face.Texture.AlignWithPointCloud(texWidth, texHeight, cloud, BoxAlignMode.Right);
-                    break;
-                case "top":
-                    face.Texture.AlignWithPointCloud(texWidth, texHeight, cloud, BoxAlignMode.Top);
-                    break;
-                case "bottom":
-                    face.Texture.AlignWithPointCloud(texWidth, texHeight, cloud, BoxAlignMode.Bottom);
-                    break;
-                default:
-                    var xvals = cloud.GetExtents().Select(x => x.Dot(face.Texture.UAxis) / face.Texture.XScale).ToList();
-                    var yvals = cloud.GetExtents().Select(x => x.Dot(face.Texture.VAxis) / face.Texture.YScale).ToList();
-                    face.Texture.XShift = -xvals.Min();
-                    face.Texture.YShift = -yvals.Min();
-                    break;
+                // texture origin at the face's minimum corner along the projection axes (all vertices considered)
+                TextureAlignment.UvBounds(face, face.Texture, out var minU, out _, out var minV, out _, warnings);
+                face.Texture.XShift = -minU;
+                face.Texture.YShift = -minV;
+            }
+            else
+            {
+                TextureAlignment.Justify(face, face.Texture, align, texWidth, texHeight, warnings);
             }
         }
 
@@ -2280,7 +2282,9 @@ namespace HammerTime.Mcp.Plugin
 
             var wrapRadius = perimeter / (2 * (float)Math.PI);
             var expectedU = angle * wrapRadius / face.Texture.XScale;
-            var rawU = Vector3.Dot(perp, face.Texture.UAxis) / face.Texture.XScale;
+            // u at the face centre is (centre . U) / XScale + XShift: cancel exactly that, so a cylinder away
+            // from the world origin wraps as seamlessly as one at the origin
+            var rawU = Vector3.Dot(faceCenter, face.Texture.UAxis) / face.Texture.XScale;
 
             var offset = centerLabel ? (texWidth / 2f) - (perimeter / labels / 2f / face.Texture.XScale) : 0;
             face.Texture.XShift = expectedU - rawU + offset;
@@ -2345,8 +2349,7 @@ namespace HammerTime.Mcp.Plugin
         {
             var doc = ResolveDocument(parameters, false);
             // B4a: require an explicit target instead of silently textureing every object.
-            var faces = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).ToList();
-            if (!faces.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "texture.apply_smart requires ids, faceRefs, or a non-empty selection.");
+            var faces = RequireFaces(doc, parameters, "texture.apply_smart", out var scope);
 
             var classify = parameters.Optional("classify", "nearest").ToLowerInvariant();
 
@@ -2465,6 +2468,7 @@ namespace HammerTime.Mcp.Plugin
             {
                 changedFaces = results.Count,
                 classify,
+                scope = scope.ToString().ToLowerInvariant(),
                 faces = results,
                 skippedFaces = new { count = skippedFaces.Count, faces = skippedFaces },
                 unassignedFaces,
@@ -2475,20 +2479,26 @@ namespace HammerTime.Mcp.Plugin
         private async Task<JToken> FaceDelete(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
-            var refs = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).ToList();
-            if (!refs.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "face.delete requires ids, faceRefs, or a non-empty selection.");
+            var refs = RequireFaces(doc, parameters, "face_delete", out var scope);
             var grouped = refs.GroupBy(x => x.Object).ToList();
             var ops = new List<IOperation>();
+            var deleted = 0;
             foreach (var group in grouped)
             {
                 var solid = group.Key as Solid;
                 if (solid == null) continue;
-                var remaining = solid.Faces.Count() - group.Count();
-                if (remaining < 4) throw new BridgeCommandException(ErrorCodes.InvalidOperation, $"Deleting faces from solid {solid.ID} would leave invalid geometry.");
+                var removed = new HashSet<long>(group.Select(x => x.Face.ID));
+                var remaining = solid.Faces.Where(f => !removed.Contains(f.ID)).ToList();
+                // Only a face that contributes no edges (degenerate) can go without opening the solid
+                if (remaining.Count < 4 || !IsClosedMesh(remaining))
+                {
+                    throw new BridgeCommandException(ErrorCodes.InvalidOperation, $"Deleting those faces would leave solid {solid.ID} open (every face of a brush is needed unless it is degenerate). Use clip_apply to reshape a brush.");
+                }
                 foreach (var entry in group) ops.Add(new RemoveMapObjectData(solid.ID, entry.Face));
+                deleted += group.Count();
             }
             await Perform(doc, ops, "face.delete").ConfigureAwait(true);
-            return ToToken(new { deletedFaces = refs.Count });
+            return ToToken(new { deletedFaces = deleted, scope = scope.ToString().ToLowerInvariant() });
         }
 
         private object VertexSnapshot(JObject parameters)
@@ -2570,13 +2580,12 @@ namespace HammerTime.Mcp.Plugin
         private async Task<JToken> VertexTriangulate(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
-            var refs = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).ToList();
-            if (!refs.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "vertex.triangulate requires ids, faceRefs, or a non-empty selection.");
+            var refs = RequireFaces(doc, parameters, "vertex_triangulate", out var scope);
             refs = refs.Where(x => x.Face.Vertices.Count > 3).ToList();
             var ops = new List<IOperation>();
-            foreach (var entry in refs) ops.AddRange(TriangulateFaceOperation(doc, entry, false));
+            foreach (var entry in refs) ops.AddRange(TriangulateFaceOperation(doc, entry));
             await Perform(doc, ops, "vertex.triangulate").ConfigureAwait(true);
-            return ToToken(new { triangulatedFaces = refs.Count });
+            return ToToken(new { triangulatedFaces = refs.Count, scope = scope.ToString().ToLowerInvariant(), warnings = new[] { "triangulated sides are coplanar: the brush is invalid until their vertices are moved out of the plane (vertex_move), then validate" } });
         }
 
         private async Task<JToken> VertexFaceEdit(JObject parameters)
@@ -2584,14 +2593,15 @@ namespace HammerTime.Mcp.Plugin
             var action = parameters.Optional("action", "poke").ToLowerInvariant();
             if (action == "triangulate") return await VertexTriangulate(parameters).ConfigureAwait(true);
 
+            if (action != "poke") throw new BridgeCommandException(ErrorCodes.InvalidRequest, "action must be poke or triangulate.");
             var doc = ResolveDocument(parameters, false);
-            var refs = ResolveFaceRefsOrObjects(doc, parameters, allowAllObjectsWhenNoTarget: false).ToList();
-            if (!refs.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "vertex.face_edit requires ids, faceRefs, or a non-empty selection.");
-            refs = refs.Where(x => x.Face.Vertices.Count > 3).ToList();
+            var distance = parameters.Optional("distance", 8f);
+            var refs = RequireFaces(doc, parameters, "vertex_face_edit", out var scope);
+            refs = refs.Where(x => x.Face.Vertices.Count >= 3).ToList();
             var ops = new List<IOperation>();
-            foreach (var entry in refs) ops.AddRange(TriangulateFaceOperation(doc, entry, action == "poke"));
+            foreach (var entry in refs) ops.AddRange(PokeFaceOperation(doc, entry, distance));
             await Perform(doc, ops, "vertex.face_edit").ConfigureAwait(true);
-            return ToToken(new { action, editedFaces = refs.Count });
+            return ToToken(new { action, distance, editedFaces = refs.Count, scope = scope.ToString().ToLowerInvariant(), warnings = distance == 0 ? new[] { "distance 0 leaves coplanar sides: the brush is invalid until the centre vertex is moved" } : Array.Empty<string>() });
         }
 
         private object ClipPreview(JObject parameters)
@@ -3162,19 +3172,65 @@ namespace HammerTime.Mcp.Plugin
             return query;
         }
 
+        /// <summary>Where a face tool's targets came from; echoed as <c>scope</c> so a stale selection is visible.</summary>
+        private enum FaceScope { None, FaceRefs, FaceSelection, Ids, Selection, Map }
+
         private IEnumerable<FaceRef> ResolveFaceRefsOrObjects(MapDocument document, JObject parameters, bool allowAllObjectsWhenNoTarget = true)
+        {
+            return ResolveFaceRefsOrObjects(document, parameters, allowAllObjectsWhenNoTarget, out _);
+        }
+
+        private IEnumerable<FaceRef> ResolveFaceRefsOrObjects(MapDocument document, JObject parameters, bool allowAllObjectsWhenNoTarget, out FaceScope scope)
         {
             var request = ParseFaceTargetRequest(parameters);
             var refs = ResolveFaceRefs(document, request.FaceRefs).ToList();
-            if (refs.Any()) return refs;
+            if (refs.Any())
+            {
+                scope = FaceScope.FaceRefs;
+                return refs;
+            }
 
-            var selection = document.Map.Data.GetOne<FaceSelection>();
-            var selectedFaces = selection?.GetSelectedFaces().Select(x => new FaceRef(x.Key, x.Value)).ToList() ?? new List<FaceRef>();
-            if (selectedFaces.Any() && !request.HasExplicitObjectTargets) return selectedFaces;
+            var selectedFaces = CurrentSelectedFaces(document).ToList();
+            if (selectedFaces.Any() && !request.HasExplicitObjectTargets)
+            {
+                scope = FaceScope.FaceSelection;
+                return selectedFaces;
+            }
 
-            if (!allowAllObjectsWhenNoTarget && !request.HasExplicitTargets) return Enumerable.Empty<FaceRef>();
+            if (request.HasExplicitObjectTargets)
+            {
+                scope = FaceScope.Ids;
+                return SolidsOf(ResolveObjects(document, request.ObjectIds)).SelectMany(s => s.Faces.Select(f => new FaceRef(s, f)));
+            }
+            if (!document.Selection.IsEmpty)
+            {
+                scope = FaceScope.Selection;
+                return SolidsOf(document.Selection).SelectMany(s => s.Faces.Select(f => new FaceRef(s, f)));
+            }
+            if (!allowAllObjectsWhenNoTarget)
+            {
+                scope = FaceScope.None;
+                return Enumerable.Empty<FaceRef>();
+            }
+            scope = FaceScope.Map;
+            return SolidsOf(document.Map.Root.FindAll()).SelectMany(s => s.Faces.Select(f => new FaceRef(s, f)));
+        }
 
-            return CandidateObjects(document, request.ObjectIds).OfType<Solid>().SelectMany(s => s.Faces.Select(f => new FaceRef(s, f)));
+        /// <summary>The faces a mutating face tool works on; fails when nothing is targeted.</summary>
+        private List<FaceRef> RequireFaces(MapDocument document, JObject parameters, string tool, out FaceScope scope)
+        {
+            var faces = ResolveFaceRefsOrObjects(document, parameters, allowAllObjectsWhenNoTarget: false, out scope).ToList();
+            if (!faces.Any())
+            {
+                throw new BridgeCommandException(ErrorCodes.InvalidRequest, $"{tool} needs targets: ids (objects), objectId with faceId/faceIds, faceRefs, a selection of objects, or faces selected with face_select.");
+            }
+            return faces;
+        }
+
+        /// <summary>Every solid inside <paramref name="objects"/> (groups and brush entities contribute their brushes).</summary>
+        private static IEnumerable<Solid> SolidsOf(IEnumerable<IMapObject> objects)
+        {
+            return objects.SelectMany(x => x.FindAll()).OfType<Solid>().Where(x => x.Hierarchy.Parent != null).Distinct();
         }
 
         private IEnumerable<FaceRef> ResolveFaceRefs(MapDocument document, JArray array)
@@ -3303,27 +3359,31 @@ namespace HammerTime.Mcp.Plugin
             };
         }
 
-        private IEnumerable<IOperation> TriangulateFaceOperation(MapDocument document, FaceRef entry, bool poke)
+        /// <summary>Fan the face into triangles from its centre pushed <paramref name="distance"/> units along the normal (the editor's poke).</summary>
+        private IEnumerable<IOperation> PokeFaceOperation(MapDocument document, FaceRef entry, float distance)
+        {
+            var vertices = entry.Face.Vertices.ToList();
+            if (vertices.Count < 3) yield break;
+            var center = vertices.Aggregate(Vector3.Zero, (a, b) => a + b) / vertices.Count + entry.Face.Plane.Normal * distance;
+            var faces = new List<Face>();
+            for (var i = 0; i < vertices.Count; i++)
+            {
+                faces.Add(MakeFaceFrom(entry.Face, document.Map.NumberGenerator.Next("Face"), new[] { vertices[i], vertices[(i + 1) % vertices.Count], center }));
+            }
+            yield return new RemoveMapObjectData(entry.Object.ID, entry.Face);
+            yield return new AddMapObjectData(entry.Object.ID, faces);
+        }
+
+        /// <summary>Split the face into a fan of coplanar triangles (the brush is invalid until vertices are moved out of the plane).</summary>
+        private IEnumerable<IOperation> TriangulateFaceOperation(MapDocument document, FaceRef entry)
         {
             var vertices = entry.Face.Vertices.ToList();
             if (vertices.Count <= 3) yield break;
             var faces = new List<Face>();
-            if (poke)
+            for (var i = 1; i < vertices.Count - 1; i++)
             {
-                var center = vertices.Aggregate(Vector3.Zero, (a, b) => a + b) / vertices.Count;
-                for (var i = 0; i < vertices.Count; i++)
-                {
-                    faces.Add(MakeFaceFrom(entry.Face, document.Map.NumberGenerator.Next("Face"), new[] { vertices[i], vertices[(i + 1) % vertices.Count], center }));
-                }
+                faces.Add(MakeFaceFrom(entry.Face, document.Map.NumberGenerator.Next("Face"), new[] { vertices[0], vertices[i], vertices[i + 1] }));
             }
-            else
-            {
-                for (var i = 1; i < vertices.Count - 1; i++)
-                {
-                    faces.Add(MakeFaceFrom(entry.Face, document.Map.NumberGenerator.Next("Face"), new[] { vertices[0], vertices[i], vertices[i + 1] }));
-                }
-            }
-
             yield return new RemoveMapObjectData(entry.Object.ID, entry.Face);
             yield return new AddMapObjectData(entry.Object.ID, faces);
         }
@@ -3337,6 +3397,25 @@ namespace HammerTime.Mcp.Plugin
                 if (i == end) break;
                 i = (i + 1) % face.Vertices.Count;
             }
+        }
+
+        /// <summary>A closed mesh: every edge is shared by exactly two faces.</summary>
+        private static bool IsClosedMesh(IReadOnlyList<Face> faces)
+        {
+            var edges = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var face in faces)
+            {
+                var count = face.Vertices.Count;
+                if (count < 3) return false;
+                for (var i = 0; i < count; i++)
+                {
+                    var a = VertexKey(face.Vertices[i]);
+                    var b = VertexKey(face.Vertices[(i + 1) % count]);
+                    var key = string.CompareOrdinal(a, b) < 0 ? a + "|" + b : b + "|" + a;
+                    edges[key] = edges.TryGetValue(key, out var n) ? n + 1 : 1;
+                }
+            }
+            return edges.Values.All(x => x == 2);
         }
 
         private static Face MakeFaceFrom(Face source, long id, IEnumerable<Vector3> vertices)
