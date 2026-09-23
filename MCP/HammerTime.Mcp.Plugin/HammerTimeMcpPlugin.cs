@@ -12,6 +12,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using HammerTime.Mcp.Shared;
 using Sledge.BspEditor.Compile;
@@ -21,6 +22,7 @@ using Sledge.BspEditor.Components;
 using Sledge.BspEditor.Documents;
 using Sledge.BspEditor.Environment;
 using Sledge.BspEditor.Editing.Commands.Pointfile;
+using Sledge.BspEditor.Editing.History;
 using Sledge.BspEditor.Editing.Problems;
 using Sledge.BspEditor.Modification;
 using Sledge.BspEditor.Modification.Operations;
@@ -53,6 +55,8 @@ using IOPath = System.IO.Path;
 using MapGroup = Sledge.BspEditor.Primitives.MapObjects.Group;
 using Plane = Sledge.DataStructures.Geometric.Plane;
 using TransformOperation = Sledge.BspEditor.Modification.Operations.Mutation.Transform;
+using TransformTexturesScale = Sledge.BspEditor.Modification.Operations.Mutation.TransformTexturesScale;
+using TransformTexturesUniform = Sledge.BspEditor.Modification.Operations.Mutation.TransformTexturesUniform;
 
 namespace HammerTime.Mcp.Plugin
 {
@@ -76,6 +80,13 @@ namespace HammerTime.Mcp.Plugin
         // (its FileName changes on save). Guarded by _historyLock for concurrent pipe handlers.
         private readonly ConditionalWeakTable<MapDocument, OperationHistory> _histories = new ConditionalWeakTable<MapDocument, OperationHistory>();
         private readonly object _historyLock = new object();
+        // Stable per-document ids (12 hex chars) and per-document request gates, keyed by instance identity
+        // so a closed document releases both.
+        private static readonly ConditionalWeakTable<MapDocument, string> DocumentIds = new ConditionalWeakTable<MapDocument, string>();
+        private static readonly ConditionalWeakTable<MapDocument, SemaphoreSlim> DocumentGates = new ConditionalWeakTable<MapDocument, SemaphoreSlim>();
+        // How long a request waits for another request on the same document before failing.
+        private static readonly TimeSpan DocumentGateTimeout = TimeSpan.FromMinutes(5);
+        private const int MaxCompileRuns = 20;
         private readonly Dictionary<string, CompileRunLog> _compileRuns = new Dictionary<string, CompileRunLog>(StringComparer.OrdinalIgnoreCase);
         private readonly object _compileLock = new object();
         private string _activeCompileRunId;
@@ -111,15 +122,34 @@ namespace HammerTime.Mcp.Plugin
         {
             if (request == null) return BridgeResponse.Fail(null, ErrorCodes.InvalidRequest, "Request is null.");
             Log("Request " + request.Method + " " + request.Id);
-            if (!string.Equals(request.Token, _config.Token, StringComparison.Ordinal))
+            if (!TokenMatches(request.Token, _config.Token))
             {
                 Log("Unauthorized request " + request.Method + " " + request.Id);
                 return BridgeResponse.Fail(request.Id, ErrorCodes.Unauthorized, "Invalid MCP bridge token.");
             }
 
+            var parameters = request.Params ?? new JObject();
+            SemaphoreSlim gate = null;
+            var acquired = false;
             try
             {
-                var result = await Dispatch(request.Method, request.Params ?? new JObject()).ConfigureAwait(false);
+                // Requests on the same document run one at a time: pipe connections are handled concurrently,
+                // and two edits interleaving on one map would corrupt its (and the MCP) history.
+                if (NeedsDocumentGate(request.Method))
+                {
+                    var target = TryResolveDocumentForLock(request.Method, parameters);
+                    if (target != null) gate = GateFor(target);
+                }
+                if (gate != null)
+                {
+                    acquired = await gate.WaitAsync(DocumentGateTimeout).ConfigureAwait(false);
+                    if (!acquired)
+                    {
+                        return BridgeResponse.Fail(request.Id, ErrorCodes.InvalidOperation, $"The document is busy with another operation (waited {DocumentGateTimeout.TotalMinutes:0} minutes); retry later.");
+                    }
+                }
+
+                var result = await Dispatch(request.Method, parameters).ConfigureAwait(false);
                 return BridgeResponse.Success(request.Id, result);
             }
             catch (BridgeCommandException ex)
@@ -132,10 +162,111 @@ namespace HammerTime.Mcp.Plugin
                 Log("Parse error: " + ex.Message);
                 return BridgeResponse.Fail(request.Id, ErrorCodes.ParseError, ex.Message);
             }
+            catch (Exception ex) when (IsParameterConversionError(ex))
+            {
+                // A parameter value of the wrong shape is the caller's mistake, not an editor failure.
+                Log("Invalid request " + request.Method + ": " + ex);
+                return BridgeResponse.Fail(request.Id, ErrorCodes.InvalidRequest, ex.Message);
+            }
             catch (Exception ex)
             {
                 Log("Unhandled bridge error: " + ex);
                 return BridgeResponse.Fail(request.Id, ErrorCodes.EditorUnavailable, ex.Message);
+            }
+            finally
+            {
+                if (acquired) gate.Release();
+            }
+        }
+
+        private static bool TokenMatches(string presented, string expected)
+        {
+            if (string.IsNullOrEmpty(presented) || string.IsNullOrEmpty(expected)) return false;
+            return CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(presented), Encoding.UTF8.GetBytes(expected));
+        }
+
+        // A conversion failure raised while reading a request parameter (JToken conversions, directly or via
+        // BridgeParsing). Argument/format errors from anywhere else are internal failures and stay editor errors.
+        private static bool IsParameterConversionError(Exception ex)
+        {
+            if (!(ex is Newtonsoft.Json.JsonException || ex is FormatException || ex is InvalidCastException ||
+                  ex is OverflowException || ex is ArgumentException))
+            {
+                return false;
+            }
+
+            var frames = new System.Diagnostics.StackTrace(ex, false).GetFrames();
+            if (frames == null) return false;
+            foreach (var frame in frames)
+            {
+                var method = frame.GetMethod();
+                var type = method?.DeclaringType;
+                if (type == null) continue;
+                if (type == typeof(BridgeParsing)) return true;
+                if (type.Namespace == "Newtonsoft.Json.Linq" &&
+                    (method.Name == "op_Explicit" || method.Name == "ToObject" || method.Name == "Value" ||
+                     method.Name == "Values" || method.Name == "Convert"))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static SemaphoreSlim GateFor(MapDocument document)
+        {
+            return DocumentGates.GetValue(document, _ => new SemaphoreSlim(1, 1));
+        }
+
+        // Methods that never act on a document skip the gate (a compile holding its document's gate must not
+        // block listing documents or tailing the compile log).
+        private static bool NeedsDocumentGate(string method)
+        {
+            switch (method)
+            {
+                case BridgeMethods.Status:
+                case BridgeMethods.Doctor:
+                case BridgeMethods.SkillGet:
+                case BridgeMethods.DocumentsList:
+                case BridgeMethods.DocumentsNew:
+                case BridgeMethods.DocumentsOpen:
+                case BridgeMethods.DocumentsOpenText:
+                case BridgeMethods.DocumentsActivate:
+                case BridgeMethods.EditorToolsList:
+                case BridgeMethods.EditorToolActivate:
+                case BridgeMethods.BrushTypesList:
+                case BridgeMethods.VertexSubtoolsList:
+                case BridgeMethods.CompileProfilesList:
+                case BridgeMethods.CompileLogTail:
+                    return false;
+                default:
+                    return true;
+            }
+        }
+
+        // Best-effort document the request will operate on (for the gate); null when it cannot be told in advance.
+        private MapDocument TryResolveDocumentForLock(string method, JObject parameters)
+        {
+            try
+            {
+                switch (method)
+                {
+                    // The capture reads the on-screen viewports, which show the active document
+                    case BridgeMethods.ViewportCapture:
+                        return ActiveDocumentOrNull();
+                    // path is the save-as destination here, not a document selector
+                    case BridgeMethods.DocumentsSave:
+                    case BridgeMethods.DocumentsExport:
+                        return ResolveSaveTarget(parameters, parameters.Optional<string>("path", null));
+                    // path is the pointfile
+                    case BridgeMethods.LeaksLoadPointfile:
+                        return ResolveDocument(parameters, false, pathSelectsDocument: false);
+                }
+                return ResolveDocument(parameters, false);
+            }
+            catch (Exception ex) when (ex is BridgeCommandException || IsParameterConversionError(ex))
+            {
+                return null;
             }
         }
 
@@ -353,10 +484,14 @@ namespace HammerTime.Mcp.Plugin
             if (!File.Exists(path)) throw new BridgeCommandException(ErrorCodes.DocumentNotFound, $"File not found: {path}");
 
             var doc = await _documents.Value.OpenDocument(path, loaderHint).ConfigureAwait(true);
+            // OpenDocument returns null when the file was already open (it just activates it)
+            var opened = doc ?? _documents.Value.GetDocumentByFileName(path) ?? FindOpenDocument(path);
             return ToToken(new
             {
-                opened = doc != null,
-                activeDocument = DocumentInfo(ActiveDocument())
+                opened = opened != null,
+                alreadyOpen = doc == null && opened != null,
+                document = DocumentInfo(opened),
+                activeDocument = DocumentInfo(ActiveDocumentOrNull())
             });
         }
 
@@ -438,10 +573,14 @@ namespace HammerTime.Mcp.Plugin
         {
             if (!string.IsNullOrWhiteSpace(path))
             {
-                var byPath = _documents.Value.OpenDocuments.OfType<MapDocument>().FirstOrDefault(x => string.Equals(x.FileName, path, StringComparison.InvariantCultureIgnoreCase));
+                var byPath = FindOpenDocument(path);
                 if (byPath != null) return byPath;
-                var byName = _documents.Value.OpenDocuments.OfType<MapDocument>().FirstOrDefault(x => string.Equals(x.Name, path, StringComparison.InvariantCultureIgnoreCase));
-                if (byName != null) return byName;
+            }
+
+            if (parameters["documentId"] != null)
+            {
+                var id = parameters.Optional<string>("documentId", null);
+                return DocumentById(id) ?? throw new BridgeCommandException(ErrorCodes.DocumentNotFound, $"Open document id not found: {id}");
             }
 
             if (parameters["documentIndex"] != null)
@@ -459,14 +598,21 @@ namespace HammerTime.Mcp.Plugin
         {
             var doc = ResolveDocument(parameters, false);
             var force = parameters.Optional("force", false);
+            if (!force && doc.HasUnsavedChanges)
+            {
+                // Never raise the editor's save prompt from a bridge call: the modal would block until someone clicks it.
+                throw new BridgeCommandException(ErrorCodes.InvalidOperation, $"Document '{doc.Name}' has unsaved changes: save it first (documents_save) or pass force:true to discard them.");
+            }
+
+            var info = DocumentInfo(doc);
             if (force)
             {
                 await _documents.Value.ForceCloseDocument(doc).ConfigureAwait(true);
-                return ToToken(new { closed = true, force = true });
+                return ToToken(new { closed = true, force = true, document = info });
             }
 
             var closed = await _documents.Value.RequestCloseDocument(doc).ConfigureAwait(true);
-            return ToToken(new { closed, force = false });
+            return ToToken(new { closed, force = false, document = info });
         }
 
         private object MapSnapshot(JObject parameters)
@@ -515,8 +661,9 @@ namespace HammerTime.Mcp.Plugin
                 matches = matches.Where(x => ObjectMatchesText(x, text));
             }
 
-            var list = matches.Take(max).Select(ObjectInfo).ToList();
-            return new { returned = list.Count, objects = list };
+            var all = matches.ToList();
+            var list = all.Take(max).Select(ObjectInfo).ToList();
+            return new { total = all.Count, returned = list.Count, objects = list };
         }
 
         private object SelectionGet(JObject parameters)
@@ -537,11 +684,7 @@ namespace HammerTime.Mcp.Plugin
             var objects = ResolveObjects(doc, parameters.Ids()).ToList();
             var operations = new List<IOperation>();
 
-            if (mode == "replace")
-            {
-                operations.Add(new Deselect(doc.Selection.ToList()));
-                operations.Add(new Select(objects));
-            }
+            if (mode == "replace") operations.AddRange(ReplaceSelectionOps(doc, objects));
             else if (mode == "add") operations.Add(new Select(objects));
             else if (mode == "remove") operations.Add(new Deselect(objects));
             else throw new BridgeCommandException(ErrorCodes.InvalidRequest, "selection mode must be replace, add, or remove.");
@@ -588,7 +731,11 @@ namespace HammerTime.Mcp.Plugin
 
         private async Task<JToken> ViewportCapture(JObject parameters)
         {
-            var doc = ResolveDocument(parameters, false);
+            // The on-screen viewports always show the active document: a selector naming another one cannot be
+            // honoured, and the render mode must be switched on the document actually being captured.
+            var requested = ResolveDocument(parameters, false);
+            var doc = ActiveDocument();
+            var selectorIgnored = !ReferenceEquals(requested, doc);
             var views = parameters.Optional("views", "all").ToLowerInvariant();
             var method = parameters.Optional("method", "auto").ToLowerInvariant();
             var includeOverlays = parameters.Optional("includeOverlays", false);
@@ -630,6 +777,7 @@ namespace HammerTime.Mcp.Plugin
 
             var engine = _engine?.Value;
             var topWarnings = new List<string>();
+            if (selectorIgnored) topWarnings.Add("documentSelectorIgnored");
 
             // Step 1: optionally switch render mode (document-global) and let the scene rebuild.
             bool changedRenderMode = false;
@@ -962,7 +1110,7 @@ namespace HammerTime.Mcp.Plugin
             if (clearOverlay) _overlay.Value.Clear(doc);
             if (clearSelection && !doc.Selection.IsEmpty)
             {
-                await Perform(doc, new IOperation[] { new Deselect(doc.Selection.ToList()) }, "viewport.clear_marks", false).ConfigureAwait(true);
+                await Perform(doc, new IOperation[] { new Deselect(doc.Selection.ToList()) }, "viewport.clear_marks").ConfigureAwait(true);
             }
 
             return ToToken(new
@@ -1010,14 +1158,15 @@ namespace HammerTime.Mcp.Plugin
         {
             var doc = ResolveDocument(parameters, false);
             var classname = parameters.Optional<string>("classname", null) ?? doc.Environment?.DefaultPointEntity ?? "info_player_start";
+            await RejectBrushEntityClass(doc, classname).ConfigureAwait(true);
             var origin = parameters.OptionalVector("origin") ?? Vector3.Zero;
             var properties = parameters.StringDictionary("properties");
-            properties.Remove("classname");
-            properties.Remove("spawnflags");
-            properties.Remove("origin");
 
             var entityData = new EntityData { Name = classname };
-            foreach (var kv in properties) entityData.Properties[kv.Key] = kv.Value;
+            foreach (var kv in properties)
+            {
+                if (!IsReservedEntityProperty(kv.Key) && kv.Value != null) entityData.Properties[kv.Key] = kv.Value;
+            }
             if (parameters["spawnflags"] != null) entityData.Flags = parameters.Optional("spawnflags", 0);
 
             var entity = new Entity(doc.Map.NumberGenerator.Next("MapObject"))
@@ -1027,16 +1176,11 @@ namespace HammerTime.Mcp.Plugin
                     entityData,
                     new ObjectColor(Colour.GetDefaultEntityColour()),
                     new Origin(origin)
-                },
-                IsSelected = parameters.Optional("select", false)
+                }
             };
 
             var ops = new List<IOperation> { new Attach(doc.Map.Root.ID, entity) };
-            if (entity.IsSelected)
-            {
-                ops.Add(new Deselect(doc.Selection.ToList()));
-                ops.Add(new Select(entity));
-            }
+            if (parameters.Optional("select", false)) ops.AddRange(ReplaceSelectionOps(doc, new[] { entity }));
 
             await Perform(doc, ops).ConfigureAwait(true);
             return ToToken(new { created = ObjectInfo(entity) });
@@ -1057,16 +1201,15 @@ namespace HammerTime.Mcp.Plugin
             if (parameters["spawnflags"] != null) ops.Add(new EditEntityDataFlags(id, parameters.Optional("spawnflags", data.Flags)));
 
             var properties = parameters.StringDictionary("properties");
-            properties.Remove("classname");
-            properties.Remove("spawnflags");
-            properties.Remove("origin");
+            foreach (var reserved in properties.Keys.Where(IsReservedEntityProperty).ToList()) properties.Remove(reserved);
             if (properties.Count > 0) ops.Add(new EditEntityDataProperties(id, properties));
 
             var origin = parameters.OptionalVector("origin");
             if (origin.HasValue)
             {
-                var current = obj.Data.GetOne<Origin>()?.Location ?? Vector3.Zero;
-                ops.Add(new TransformOperation(Matrix4x4.CreateTranslation(origin.Value - current), obj));
+                // A brush entity has no Origin data: its position is the centre of its brushes
+                var current = obj.Data.GetOne<Origin>()?.Location ?? obj.BoundingBox?.Center ?? Vector3.Zero;
+                ops.AddRange(TransformOps(doc, Matrix4x4.CreateTranslation(origin.Value - current), new[] { obj }));
             }
 
             await Perform(doc, ops).ConfigureAwait(true);
@@ -1124,11 +1267,7 @@ namespace HammerTime.Mcp.Plugin
                 ops.Add(new Attach(entity.ID, group.ToList()));
             }
 
-            if (parameters.Optional("select", true))
-            {
-                ops.Add(new Deselect(doc.Selection.ToList()));
-                ops.Add(new Select(entity));
-            }
+            if (parameters.Optional("select", true)) ops.AddRange(ReplaceSelectionOps(doc, new[] { entity }));
 
             await Perform(doc, ops, "entity.tie_brushes").ConfigureAwait(true);
             var tiedEntity = ResolveObject(doc, entity.ID);
@@ -1156,30 +1295,37 @@ namespace HammerTime.Mcp.Plugin
             var deleteEmptyEntity = parameters.Optional("deleteEmptyEntity", true);
             foreach (var entity in entities)
             {
-                var children = entity.FindAll()
-                    .Where(x => x.ID != entity.ID)
-                    .OfType<Solid>()
-                    .Where(x => x.Hierarchy.Parent?.ID == entity.ID)
-                    .ToList();
+                // Every solid under the entity, including those inside nested groups
+                var children = entity.FindAll().Where(x => x.ID != entity.ID).OfType<Solid>().ToList();
                 if (!children.Any()) continue;
                 moved.AddRange(children);
-                ops.Add(new Detatch(entity.ID, children));
+                foreach (var byParent in children.GroupBy(x => x.Hierarchy.Parent.ID))
+                {
+                    ops.Add(new Detatch(byParent.Key, byParent.ToList()));
+                }
                 ops.Add(new Attach(doc.Map.Root.ID, children));
-                var movedChildIds = new HashSet<long>(children.Select(x => x.ID));
-                var hasOtherChildren = entity.Hierarchy.Any(x => !movedChildIds.Contains(x.ID));
-                if (deleteEmptyEntity && !hasOtherChildren && entity.Hierarchy.Parent != null)
+
+                // Groups that held nothing but solids (and such groups) are empty now; a group that also holds
+                // something else (a point entity, say) keeps it and stays.
+                var emptied = TopLevel(entity.FindAll()
+                        .OfType<MapGroup>()
+                        .Where(g => g.FindAll().All(x => x.ID == g.ID || x is Solid || x is MapGroup)))
+                    .ToList();
+                foreach (var byParent in emptied.GroupBy(x => x.Hierarchy.Parent.ID))
+                {
+                    ops.Add(new Detatch(byParent.Key, byParent.ToList()));
+                }
+                var emptiedIds = new HashSet<long>(emptied.Select(x => x.ID));
+                var keepsOtherChildren = entity.Hierarchy.Any(x => !(x is Solid) && !emptiedIds.Contains(x.ID));
+                if (deleteEmptyEntity && !keepsOtherChildren && entity.Hierarchy.Parent != null)
                 {
                     ops.Add(new Detatch(entity.Hierarchy.Parent.ID, entity));
                     deletedEntities.Add(entity.ID);
                 }
             }
-            if (!moved.Any()) throw new BridgeCommandException(ErrorCodes.InvalidOperation, "No solid brush children were found to untie.");
+            if (!moved.Any()) throw new BridgeCommandException(ErrorCodes.InvalidOperation, "The targeted brush entities contain no solids to untie.");
 
-            if (parameters.Optional("select", true))
-            {
-                ops.Add(new Deselect(doc.Selection.ToList()));
-                ops.Add(new Select(moved));
-            }
+            if (parameters.Optional("select", true)) ops.AddRange(ReplaceSelectionOps(doc, moved));
 
             await Perform(doc, ops, "entity.untie_brushes").ConfigureAwait(true);
             return ToToken(new
@@ -1237,6 +1383,7 @@ namespace HammerTime.Mcp.Plugin
                     ["properties"] = JObject.FromObject(properties),
                     ["spawnflags"] = parameters["spawnflags"]
                 };
+                CopyDocumentSelector(parameters, createParams);
                 return await EntityCreate(createParams).ConfigureAwait(true);
             }
 
@@ -1248,7 +1395,17 @@ namespace HammerTime.Mcp.Plugin
             };
             if (parameters["origin"] != null) updateParams["origin"] = parameters["origin"];
             if (parameters["spawnflags"] != null) updateParams["spawnflags"] = parameters["spawnflags"];
+            CopyDocumentSelector(parameters, updateParams);
             return await EntityUpdate(updateParams).ConfigureAwait(true);
+        }
+
+        // Forwarded calls must act on the document the caller named, not fall back to the active one.
+        private static void CopyDocumentSelector(JObject from, JObject to)
+        {
+            foreach (var key in new[] { "documentId", "path", "documentIndex" })
+            {
+                if (from[key] != null) to[key] = from[key].DeepClone();
+            }
         }
 
         private object BrushTypesList()
@@ -1291,16 +1448,28 @@ namespace HammerTime.Mcp.Plugin
             var texture = parameters.Optional<string>("texture", null)
                           ?? doc.Map.Data.GetOne<ActiveTexture>()?.Name
                           ?? "aaatrigger";
-            ApplyBrushParameters(brush, parameters["parameters"] as JObject ?? parameters);
 
             var bounds = new Box(min, max);
-            if (bounds.IsEmpty()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "Brush bounds cannot be empty.");
+            if (bounds.IsEmpty() || bounds.SmallestDimension <= 0) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "Brush bounds must have a positive size on every axis (min and max may not share a coordinate).");
 
             var round = parameters.Optional("round", true);
             var rounding = brush.CanRound && round ? 0 : 2;
             if (bounds.SmallestDimension < 10) rounding = 2;
 
-            var created = brush.Create(doc.Map.NumberGenerator, bounds, texture, rounding).ToList();
+            // The brush parameter controls are the editor's own (the Brush tool sidebar shows them): apply the
+            // call's overrides only for the duration of the call.
+            List<IMapObject> created;
+            var bindings = ReadBrushControls(brush);
+            var saved = bindings.Select(x => (Binding: x, Value: x.CurrentValue())).ToList();
+            try
+            {
+                ApplyBrushParameters(bindings, parameters["parameters"] as JObject ?? parameters);
+                created = brush.Create(doc.Map.NumberGenerator, bounds, texture, rounding).ToList();
+            }
+            finally
+            {
+                foreach (var entry in saved) entry.Binding.RestoreValue(entry.Value);
+            }
             if (!created.Any())
             {
                 throw new BridgeCommandException(ErrorCodes.InvalidOperation, $"Brush type '{brush.Name}' did not produce geometry. Check bounds and brush parameters.");
@@ -1330,11 +1499,7 @@ namespace HammerTime.Mcp.Plugin
 
             var select = parameters.Optional("select", false);
             var ops = new List<IOperation> { new Attach(doc.Map.Root.ID, createdObject) };
-            if (select)
-            {
-                ops.Add(new Deselect(doc.Selection.ToList()));
-                ops.Add(new Select(createdObject.FindAll()));
-            }
+            if (select) ops.AddRange(ReplaceSelectionOps(doc, createdObject.FindAll()));
 
             await Perform(doc, ops).ConfigureAwait(true);
             return ToToken(new
@@ -1357,31 +1522,11 @@ namespace HammerTime.Mcp.Plugin
             }
 
             var definitions = planeDefs.OfType<JObject>().Select(ReadPlaneDefinition).ToList();
-            var polyhedron = new Polyhedron(definitions.Select(x => x.Plane));
-            if (!polyhedron.IsValid()) throw new BridgeCommandException(ErrorCodes.InvalidOperation, "Plane set did not produce a valid convex brush.");
-
-            var solid = new Solid(doc.Map.NumberGenerator.Next("MapObject"));
-            foreach (var polygon in polyhedron.Polygons)
-            {
-                var definition = definitions
-                    .OrderByDescending(x => Vector3.Dot(x.Plane.Normal, polygon.Plane.Normal))
-                    .First();
-                var face = new Face(doc.Map.NumberGenerator.Next("Face"))
-                {
-                    Texture = definition.Texture.Clone()
-                };
-                face.Vertices.AddRange(polygon.Vertices);
-                solid.Data.Add(face);
-            }
-            solid.DescendantsChanged();
+            var solid = MapText.SolidFromPlanes(definitions, doc.Map.NumberGenerator, "Plane set did not produce a valid convex brush.");
 
             var select = parameters.Optional("select", true);
             var ops = new List<IOperation> { new Attach(doc.Map.Root.ID, solid) };
-            if (select)
-            {
-                ops.Add(new Deselect(doc.Selection.ToList()));
-                ops.Add(new Select(solid));
-            }
+            if (select) ops.AddRange(ReplaceSelectionOps(doc, new[] { solid }));
 
             await Perform(doc, ops, "brush.create_from_planes").ConfigureAwait(true);
             return ToToken(new { created = ObjectInfo(solid), faces = solid.Faces.Select(f => FaceInfo(solid, f)).ToList() });
@@ -1431,7 +1576,8 @@ namespace HammerTime.Mcp.Plugin
         private async Task<JToken> ObjectsDelete(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
-            var objects = ResolveObjects(doc, parameters.Ids()).Where(x => x.Hierarchy.Parent != null).ToList();
+            // A child of a deleted parent goes with it: count and detach only the top-most objects
+            var objects = TopLevel(ResolveObjects(doc, parameters.Ids())).Where(x => x.Hierarchy.Parent != null).ToList();
             if (!objects.Any()) return ToToken(new { deleted = 0 });
 
             var ops = objects
@@ -1445,24 +1591,47 @@ namespace HammerTime.Mcp.Plugin
         private async Task<JToken> ObjectsTransform(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
-            var objects = ResolveObjects(doc, parameters.Ids()).ToList();
+            // A transform recurses into children, so an object and its descendants must be applied once
+            var objects = TopLevel(ResolveObjects(doc, parameters.Ids())).ToList();
             if (!objects.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "objects.transform requires ids.");
 
-            var pivot = parameters.OptionalVector("pivot") ?? Vector3.Zero;
             var translation = parameters.OptionalVector("translation") ?? Vector3.Zero;
             var scale = parameters.OptionalVector("scale") ?? Vector3.One;
             var rotation = parameters.OptionalVector("rotationDegrees") ?? Vector3.Zero;
+            if (Math.Abs(scale.X) < 1e-4f || Math.Abs(scale.Y) < 1e-4f || Math.Abs(scale.Z) < 1e-4f)
+            {
+                throw new BridgeCommandException(ErrorCodes.InvalidRequest, "scale components must be non-zero (a zero scale flattens the objects and cannot be undone).");
+            }
+            // Like the editor, scale and rotate about the objects' own centre unless a pivot is given
+            var boxes = objects.Select(x => x.BoundingBox).Where(x => x != null && !x.IsEmpty()).ToList();
+            var pivot = parameters.OptionalVector("pivot") ?? (boxes.Any() ? new Box(boxes).Center : Vector3.Zero);
 
-            var matrix =
-                Matrix4x4.CreateTranslation(-pivot) *
-                Matrix4x4.CreateScale(scale) *
-                Matrix4x4.CreateRotationX(Degrees(rotation.X)) *
-                Matrix4x4.CreateRotationY(Degrees(rotation.Y)) *
-                Matrix4x4.CreateRotationZ(Degrees(rotation.Z)) *
-                Matrix4x4.CreateTranslation(pivot + translation);
+            // Scale first, then rotate and move, as two transforms: the editor's texture lock treats a scale
+            // (texture scale lock) and a move/rotation (texture lock) differently.
+            var scaling = Vector3.Distance(scale, Vector3.One) > 1e-6f;
+            var moving = rotation != Vector3.Zero || translation != Vector3.Zero;
+            var ops = new List<IOperation>();
+            if (scaling)
+            {
+                var scaleMatrix =
+                    Matrix4x4.CreateTranslation(-pivot) *
+                    Matrix4x4.CreateScale(scale) *
+                    Matrix4x4.CreateTranslation(pivot);
+                ops.AddRange(TransformOps(doc, scaleMatrix, objects, isScale: true));
+            }
+            if (moving || !scaling)
+            {
+                var moveMatrix =
+                    Matrix4x4.CreateTranslation(-pivot) *
+                    Matrix4x4.CreateRotationX(Degrees(rotation.X)) *
+                    Matrix4x4.CreateRotationY(Degrees(rotation.Y)) *
+                    Matrix4x4.CreateRotationZ(Degrees(rotation.Z)) *
+                    Matrix4x4.CreateTranslation(pivot + translation);
+                ops.AddRange(TransformOps(doc, moveMatrix, objects));
+            }
 
-            await Perform(doc, new[] { new TransformOperation(matrix, objects) }).ConfigureAwait(true);
-            return ToToken(new { transformed = objects.Select(x => ObjectInfo(ResolveObject(doc, x.ID))).ToList() });
+            await Perform(doc, ops, "objects.transform").ConfigureAwait(true);
+            return ToToken(new { pivot = pivot.ToDto(), transformed = objects.Select(x => ObjectInfo(ResolveObject(doc, x.ID))).ToList() });
         }
 
         private async Task<JToken> ProblemsCheck(JObject parameters)
@@ -1501,6 +1670,9 @@ namespace HammerTime.Mcp.Plugin
             var doc = ResolveDocument(parameters, false);
             var checkerName = parameters.Required<string>("checker");
             var index = parameters.Optional("index", 0);
+            var selectedOnly = parameters.Optional("selectedOnly", false);
+            var selectedIds = new HashSet<long>(doc.Selection.SelectMany(x => x.FindAll()).Select(x => x.ID));
+            Predicate<IMapObject> filter = selectedOnly ? obj => obj != null && selectedIds.Contains(obj.ID) : _ => true;
             var checker = _problemChecks.Select(x => x.Value).FirstOrDefault(x =>
                 string.Equals(x.GetType().FullName, checkerName, StringComparison.InvariantCultureIgnoreCase) ||
                 string.Equals(x.Name, checkerName, StringComparison.InvariantCultureIgnoreCase) ||
@@ -1509,15 +1681,16 @@ namespace HammerTime.Mcp.Plugin
             if (checker == null) throw new BridgeCommandException(ErrorCodes.InvalidRequest, $"Problem checker not found: {checkerName}");
             if (!checker.CanFix) throw new BridgeCommandException(ErrorCodes.InvalidOperation, $"Problem checker cannot fix: {checkerName}");
 
-            var problems = await checker.Check(doc, _ => true).ConfigureAwait(true);
-            if (index < 0 || index >= problems.Count) throw new BridgeCommandException(ErrorCodes.InvalidRequest, $"Problem index {index} is out of range.");
+            var problems = await checker.Check(doc, filter).ConfigureAwait(true);
+            if (index < 0 || index >= problems.Count) throw new BridgeCommandException(ErrorCodes.InvalidRequest, $"Problem index {index} is out of range (the checker reports {problems.Count} problem(s) now; re-run problems_check with the same selectedOnly).");
             await checker.Fix(doc, problems[index]).ConfigureAwait(true);
-            return ToToken(new { fixedProblem = index, checker = checker.GetType().FullName });
+            return ToToken(new { fixedProblem = index, text = problems[index].Text, checker = checker.GetType().FullName });
         }
 
         private async Task<JToken> LeaksLoadPointfile(JObject parameters)
         {
-            var doc = ResolveDocument(parameters, false);
+            // path is the pointfile to read, not a document selector
+            var doc = ResolveDocument(parameters, false, pathSelectsDocument: false);
             var path = parameters.Optional<string>("path", null);
             var text = parameters.Optional<string>("text", null);
             if (text == null)
@@ -1528,7 +1701,15 @@ namespace HammerTime.Mcp.Plugin
             }
 
             var lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n').Where(x => !string.IsNullOrWhiteSpace(x)).ToArray();
-            var pointFile = Pointfile.Parse(lines);
+            Pointfile pointFile;
+            try
+            {
+                pointFile = Pointfile.Parse(lines);
+            }
+            catch (Exception ex)
+            {
+                throw new BridgeCommandException(ErrorCodes.ParseError, "Could not parse the pointfile (.lin lines are 'x y z - x y z', .pts lines are 'x y z'): " + ex.Message);
+            }
             await MapDocumentOperation.Perform(doc, new TrivialOperation(
                 d => d.Map.Data.Replace(pointFile),
                 c => c.Update(c.Document.Map.Root))).ConfigureAwait(true);
@@ -2515,7 +2696,7 @@ namespace HammerTime.Mcp.Plugin
         private object VertexSnapshot(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
-            var solids = CandidateObjects(doc, parameters.Ids()).OfType<Solid>().ToList();
+            var solids = SolidsOf(CandidateObjects(doc, parameters.Ids())).ToList();
             var vertices = solids.SelectMany(s => s.Faces.SelectMany(f => f.Vertices.Select((v, i) => new
                 {
                     objectId = s.ID,
@@ -2546,35 +2727,60 @@ namespace HammerTime.Mcp.Plugin
             var position = parameters.OptionalVector("position");
             if (!delta.HasValue && !position.HasValue) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "vertex.move requires delta or position.");
 
-            var keys = (parameters["vertexKeys"] as JArray)?.Select(x => x.Value<string>()).Where(x => !string.IsNullOrWhiteSpace(x)).ToList() ?? new List<string>();
+            var keyList = (parameters["vertexKeys"] as JArray)?.Select(x => x.Value<string>()).Where(x => !string.IsNullOrWhiteSpace(x)).ToList() ?? new List<string>();
+            var keys = new HashSet<string>(keyList, StringComparer.Ordinal);
             var refs = ResolveVertexRefs(doc, parameters["vertexRefs"] as JArray).ToList();
+            // A vertex reference names a corner of the solid: every face sharing that corner moves with it,
+            // otherwise the solid would be torn open along the neighbouring faces
+            var refKeys = refs.GroupBy(r => r.Object.ID).ToDictionary(g => g.Key, g => new HashSet<string>(g.Select(r => VertexKey(r.Face.Vertices[r.VertexIndex])), StringComparer.Ordinal));
             var changed = new HashSet<string>(StringComparer.Ordinal);
             var ops = new List<IOperation>();
 
-            foreach (var solid in CandidateObjects(doc, parameters.Ids()).OfType<Solid>())
+            // Only the solids named (by ids, the selection, or the vertexRefs) are touched, never the whole map
+            var named = parameters.Ids().Length > 0 || !doc.Selection.IsEmpty
+                ? RequestedOrSelectedObjects(doc, parameters)
+                : Enumerable.Empty<IMapObject>();
+            var candidates = SolidsOf(named.Concat(refs.Select(r => r.Object))).ToList();
+            foreach (var solid in candidates)
             {
+                var clones = new List<(Face Original, Face Clone)>();
+                var touchedSolid = false;
                 foreach (var face in solid.Faces)
                 {
                     var clone = (Face)face.Clone();
                     var touched = false;
                     for (var i = 0; i < clone.Vertices.Count; i++)
                     {
-                        var keyMatch = keys.Contains(VertexKey(clone.Vertices[i]), StringComparer.Ordinal);
-                        var refMatch = refs.Any(r => r.Object.ID == solid.ID && r.Face.ID == face.ID && r.VertexIndex == i);
-                        if (!keyMatch && !refMatch) continue;
+                        var key = VertexKey(clone.Vertices[i]);
+                        var matched = keys.Contains(key) || (refKeys.TryGetValue(solid.ID, out var solidKeys) && solidKeys.Contains(key));
+                        if (!matched) continue;
                         clone.Vertices[i] = position ?? clone.Vertices[i] + delta.Value;
                         touched = true;
                     }
-                    if (!touched) continue;
-                    ops.Add(new RemoveMapObjectData(solid.ID, face));
-                    ops.Add(new AddMapObjectData(solid.ID, clone));
-                    changed.Add($"{solid.ID}:{face.ID}");
+                    clones.Add((face, clone));
+                    touchedSolid |= touched;
+                    if (touched) changed.Add($"{solid.ID}:{face.ID}");
+                }
+                if (!touchedSolid) continue;
+
+                // The moved solid must still be a valid brush (planar convex faces, no coplanar sides); a brush
+                // that was already invalid may still be edited, typically to repair it
+                var preview = new Solid(0);
+                foreach (var pair in clones) preview.Data.Add(pair.Clone);
+                if (solid.IsValid() && !preview.IsValid())
+                {
+                    throw new BridgeCommandException(ErrorCodes.InvalidOperation, $"Moving those vertices would make solid {solid.ID} invalid (a face becomes non-planar or the brush non-convex). Move all vertices of the affected faces, split the face first, or use clip_apply.");
+                }
+                foreach (var pair in clones.Where(x => changed.Contains($"{solid.ID}:{x.Original.ID}")))
+                {
+                    ops.Add(new RemoveMapObjectData(solid.ID, pair.Original));
+                    ops.Add(new AddMapObjectData(solid.ID, pair.Clone));
                 }
             }
 
-            if (!ops.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "No vertices matched vertexKeys or vertexRefs.");
+            if (!ops.Any()) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "No vertices matched vertexKeys or vertexRefs on the targeted solids (pass ids or select the solids when using vertexKeys).");
             await Perform(doc, ops, "vertex.move").ConfigureAwait(true);
-            return ToToken(new { changedFaces = changed.Count, vertexKeys = keys });
+            return ToToken(new { changedFaces = changed.Count, vertexKeys = keyList });
         }
 
         private async Task<JToken> VertexSplitFace(JObject parameters)
@@ -2619,7 +2825,7 @@ namespace HammerTime.Mcp.Plugin
         {
             var doc = ResolveDocument(parameters, false);
             var plane = ResolvePlane(parameters);
-            var solids = CandidateObjects(doc, parameters.Ids()).OfType<Solid>().ToList();
+            var solids = SolidsOf(CandidateObjects(doc, parameters.Ids())).ToList();
             var preview = solids.Select(s =>
             {
                 var classes = s.Faces.SelectMany(f => f.Vertices).Select(v => plane.OnPlane(v)).Distinct().ToList();
@@ -2644,23 +2850,24 @@ namespace HammerTime.Mcp.Plugin
             var doc = ResolveDocument(parameters, false);
             var plane = ResolvePlane(parameters);
             side = (side ?? "front").ToLowerInvariant();
-            var solids = CandidateObjects(doc, parameters.Ids()).OfType<Solid>().ToList();
+            if (side != "front" && side != "back" && side != "both") throw new BridgeCommandException(ErrorCodes.InvalidRequest, "side must be front, back, or both.");
+            // A cut is destructive: it needs explicit ids or a selection, never the whole map by default
+            var solids = SolidsOf(RequestedOrSelectedObjects(doc, parameters)).ToList();
             var ops = new List<IOperation>();
             var changed = 0;
             var warnings = new List<object>();
             foreach (var solid in solids)
             {
-                if (!solid.Split(doc.Map.NumberGenerator, plane, out var back, out var front)) continue;
-                var created = new List<IMapObject>();
-                if (side == "front" || side == "both") created.Add(front);
-                if (side == "back" || side == "both") created.Add(back);
-                if (!created.Any()) continue;
                 var parent = solid.Hierarchy.Parent;
                 if (parent == null)
                 {
                     warnings.Add(new { objectId = solid.ID, warning = "Solid has no parent; skipped clip." });
                     continue;
                 }
+                if (!solid.Split(doc.Map.NumberGenerator, plane, out var back, out var front)) continue;
+                var created = new List<IMapObject>();
+                if (side == "front" || side == "both") created.Add(front);
+                if (side == "back" || side == "both") created.Add(back);
                 ops.Add(new Detatch(parent.ID, solid));
                 ops.Add(new Attach(parent.ID, created));
                 changed++;
@@ -2711,13 +2918,9 @@ namespace HammerTime.Mcp.Plugin
             if (!contents.Any()) throw new BridgeCommandException(ErrorCodes.InvalidOperation, "Prefab did not contain map objects.");
             var center = new Box(contents.Select(x => x.BoundingBox)).Center;
             var translation = Matrix4x4.CreateTranslation(origin - center);
-            var ops = new List<IOperation>
-            {
-                new Attach(doc.Map.Root.ID, contents),
-                new TransformOperation(translation, contents),
-                new Deselect(doc.Selection.ToList()),
-                new Select(contents)
-            };
+            var ops = new List<IOperation> { new Attach(doc.Map.Root.ID, contents) };
+            ops.AddRange(TransformOps(doc, translation, contents));
+            ops.AddRange(ReplaceSelectionOps(doc, contents));
             await Perform(doc, ops, "prefab.create").ConfigureAwait(true);
             return ToToken(new { library = path, index, created = contents.Select(ObjectInfo).ToList() });
         }
@@ -2729,24 +2932,19 @@ namespace HammerTime.Mcp.Plugin
             if (id == 0) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "object_export_maptext requires id or ids[0].");
             var obj = ResolveObject(doc, id);
             if (!(obj is Solid solid)) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "object_export_maptext currently exports Solid brush objects.");
-            return new { objectId = solid.ID, mapText = SolidToMapText(solid) };
+            return new { objectId = solid.ID, mapText = MapText.Write(solid) };
         }
 
         private async Task<JToken> ObjectImportMapText(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
             var text = parameters.Required<string>("text");
-            var solid = ParseSolidMapText(text, doc.Map.NumberGenerator);
-            solid.DescendantsChanged();
+            var solid = MapText.ParseSolid(text, doc.Map.NumberGenerator);
             var select = parameters.Optional("select", true);
             var ops = new List<IOperation> { new Attach(doc.Map.Root.ID, solid) };
-            if (select)
-            {
-                ops.Add(new Deselect(doc.Selection.ToList()));
-                ops.Add(new Select(solid));
-            }
+            if (select) ops.AddRange(ReplaceSelectionOps(doc, new[] { solid }));
             await Perform(doc, ops, "object.import_maptext").ConfigureAwait(true);
-            return ToToken(new { created = ObjectInfo(solid), mapText = SolidToMapText(solid) });
+            return ToToken(new { created = ObjectInfo(solid), mapText = MapText.Write(solid) });
         }
 
         private async Task<JToken> ObjectImportMapTextBatch(JObject parameters)
@@ -2764,25 +2962,19 @@ namespace HammerTime.Mcp.Plugin
             else
             {
                 var text = parameters.Required<string>("text");
-                blocks = SplitBrushBlocks(text);
+                blocks = MapText.SplitBrushBlocks(text);
             }
             if (blocks.Count == 0) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "No brush blocks provided.");
 
             var solids = new List<Solid>();
             foreach (var block in blocks)
             {
-                var solid = ParseSolidMapText(block, doc.Map.NumberGenerator);
-                solid.DescendantsChanged();
-                solids.Add(solid);
+                solids.Add(MapText.ParseSolid(block, doc.Map.NumberGenerator));
             }
 
             var select = parameters.Optional("select", true);
             var ops = new List<IOperation> { new Attach(doc.Map.Root.ID, solids) };
-            if (select)
-            {
-                ops.Add(new Deselect(doc.Selection.ToList()));
-                ops.Add(new Select(solids));
-            }
+            if (select) ops.AddRange(ReplaceSelectionOps(doc, solids));
             await Perform(doc, ops, "object.import_maptext_batch").ConfigureAwait(true);
             return ToToken(new { count = solids.Count, created = solids.Select(ObjectInfo).ToList() });
         }
@@ -2856,8 +3048,30 @@ namespace HammerTime.Mcp.Plugin
             {
                 _compileRuns[runId] = log;
                 _activeCompileRunId = runId;
+                // Keep the last runs only (each holds up to 4000 log lines)
+                foreach (var stale in _compileRuns.Values.Where(x => x.FinishedUtc != null).OrderByDescending(x => x.StartedUtc).Skip(MaxCompileRuns - 1).ToList())
+                {
+                    _compileRuns.Remove(stale.Id);
+                }
             }
 
+            try
+            {
+                return await RunCompileBatch(doc, parameters, profile, runId, log).ConfigureAwait(true);
+            }
+            finally
+            {
+                // Also when the batch throws: the run must not stay "active" and collect later compiles' output
+                if (log.FinishedUtc == null) log.FinishedUtc = DateTime.UtcNow;
+                lock (_compileLock)
+                {
+                    if (_activeCompileRunId == runId) _activeCompileRunId = null;
+                }
+            }
+        }
+
+        private async Task<JToken> RunCompileBatch(MapDocument doc, JObject parameters, string profile, string runId, CompileRunLog log)
+        {
             var args = new List<BatchArgument>();
             foreach (var prop in (parameters["arguments"] as JObject ?? new JObject()).Properties())
             {
@@ -2890,27 +3104,29 @@ namespace HammerTime.Mcp.Plugin
                 batch.Steps = batch.Steps.Where(x => steps.Any(step => x.GetType().Name.IndexOf(step, StringComparison.InvariantCultureIgnoreCase) >= 0)).ToList();
             }
             await batch.Run(doc).ConfigureAwait(true);
-            log.FinishedUtc = DateTime.UtcNow;
-            log.Successful = batch.Successful;
+            int lineCount;
             lock (_compileLock)
             {
-                if (_activeCompileRunId == runId) _activeCompileRunId = null;
+                log.Successful = batch.Successful;
+                log.FinishedUtc = DateTime.UtcNow;
+                lineCount = log.Lines.Count;
             }
-            return ToToken(new { runId, profile, successful = batch.Successful, logLines = log.Lines.Count });
+            return ToToken(new { runId, profile, successful = batch.Successful, logLines = lineCount });
         }
 
         private object CompileLogTail(JObject parameters)
         {
             var runId = parameters.Optional<string>("runId", null);
             var count = parameters.Optional("count", 100);
-            CompileRunLog log = null;
             lock (_compileLock)
             {
+                CompileRunLog log = null;
                 if (runId == null) log = _compileRuns.Values.OrderByDescending(x => x.StartedUtc).FirstOrDefault();
                 else _compileRuns.TryGetValue(runId, out log);
+                if (log == null) return new { runId, lines = new string[0] };
+                // Copied inside the lock: the compile's output handler appends to Lines concurrently.
+                return new { runId = log.Id, successful = log.Successful, finished = log.FinishedUtc != null, lines = log.Lines.Skip(Math.Max(0, log.Lines.Count - count)).ToList() };
             }
-            if (log == null) return new { runId, lines = new string[0] };
-            return new { runId = log.Id, successful = log.Successful, lines = log.Lines.Skip(Math.Max(0, log.Lines.Count - count)).ToList() };
         }
 
         private async Task<JToken> MapValidate(JObject parameters)
@@ -2922,23 +3138,55 @@ namespace HammerTime.Mcp.Plugin
         {
             var doc = ResolveDocument(parameters, false);
             var fixedProblems = new List<object>();
+            var remaining = new List<object>();
             foreach (var checker in _problemChecks.Select(x => x.Value).Where(x => x.CanFix))
             {
-                var problems = await checker.Check(doc, _ => true).ConfigureAwait(true);
-                foreach (var problem in problems)
+                // Fixing one problem can change the others (ids get renumbered, objects move), so re-check after
+                // each fix instead of walking a stale list. A fix that changes nothing is skipped from then on
+                // and the next problem is tried.
+                var checkerName = checker.GetType().FullName;
+                var stuck = new HashSet<string>(StringComparer.Ordinal);
+                string lastKey = null;
+                string lastText = null;
+                var lastCount = 0;
+                var maxRounds = -1;
+                for (var round = 0; ; round++)
                 {
-                    await checker.Fix(doc, problem).ConfigureAwait(true);
-                    fixedProblems.Add(new { checker = checker.GetType().FullName, problem.Text });
+                    var problems = await checker.Check(doc, _ => true).ConfigureAwait(true);
+                    if (maxRounds < 0) maxRounds = problems.Count * 2 + 10;
+                    if (lastKey != null)
+                    {
+                        var stillThere = problems.Any(x => ProblemKey(x) == lastKey);
+                        if (problems.Count < lastCount || !stillThere) fixedProblems.Add(new { checker = checkerName, Text = lastText });
+                        else stuck.Add(lastKey);
+                        lastKey = null;
+                    }
+
+                    var next = problems.FirstOrDefault(x => !stuck.Contains(ProblemKey(x)));
+                    if (next == null || round >= maxRounds)
+                    {
+                        if (problems.Count > 0) remaining.Add(new { checker = checkerName, count = problems.Count, first = problems[0].Text });
+                        break;
+                    }
+                    lastKey = ProblemKey(next);
+                    lastText = next.Text;
+                    lastCount = problems.Count;
+                    await checker.Fix(doc, next).ConfigureAwait(true);
                 }
             }
-            return ToToken(new { fixedCount = fixedProblems.Count, fixedProblems });
+            return ToToken(new { fixedCount = fixedProblems.Count, fixedProblems, remaining });
+        }
+
+        private static string ProblemKey(Problem problem)
+        {
+            return problem.Text + "|" + string.Join(",", (problem.Objects ?? new List<IMapObject>()).Select(x => x.ID));
         }
 
         private async Task<JToken> SelectionFilter(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
             var filtered = FilterObjects(doc, doc.Selection.ToList(), parameters).ToList();
-            await Perform(doc, new IOperation[] { new Deselect(doc.Selection.ToList()), new Select(filtered) }, "selection.filter", false).ConfigureAwait(true);
+            await Perform(doc, ReplaceSelectionOps(doc, filtered), "selection.filter").ConfigureAwait(true);
             return ToToken(SelectionGet(parameters));
         }
 
@@ -2946,14 +3194,16 @@ namespace HammerTime.Mcp.Plugin
         {
             var doc = ResolveDocument(parameters, false);
             var mode = parameters.Optional("mode", "children").ToLowerInvariant();
+            if (mode != "parents" && mode != "children" && mode != "siblings") throw new BridgeCommandException(ErrorCodes.InvalidRequest, "selection.grow mode must be parents, children, or siblings.");
             var set = new HashSet<IMapObject>(doc.Selection);
             foreach (var obj in doc.Selection.ToList())
             {
-                if (mode == "parents" && obj.Hierarchy.Parent != null) set.Add(obj.Hierarchy.Parent);
-                else if (mode == "siblings" && obj.Hierarchy.Parent != null) foreach (var s in obj.Hierarchy.Parent.Hierarchy) set.Add(s);
+                // The world root is never selectable
+                if (mode == "parents") { if (obj.Hierarchy.Parent != null && obj.Hierarchy.Parent.Hierarchy.Parent != null) set.Add(obj.Hierarchy.Parent); }
+                else if (mode == "siblings") { if (obj.Hierarchy.Parent != null) foreach (var s in obj.Hierarchy.Parent.Hierarchy) set.Add(s); }
                 else foreach (var child in obj.FindAll()) set.Add(child);
             }
-            await Perform(doc, new IOperation[] { new Deselect(doc.Selection.ToList()), new Select(set) }, "selection.grow", false).ConfigureAwait(true);
+            await Perform(doc, ReplaceSelectionOps(doc, set), "selection.grow").ConfigureAwait(true);
             return ToToken(SelectionGet(parameters));
         }
 
@@ -2962,27 +3212,32 @@ namespace HammerTime.Mcp.Plugin
             var doc = ResolveDocument(parameters, false);
             var bounds = RequiredBox(parameters);
             var mode = parameters.Optional("mode", "intersects").ToLowerInvariant();
+            if (mode != "intersects" && mode != "inside") throw new BridgeCommandException(ErrorCodes.InvalidRequest, "selection.by_bounds mode must be intersects or inside.");
             var objects = doc.Map.Root.FindAll()
                 .Where(x => x.Hierarchy.Parent != null && x.BoundingBox != null && !x.BoundingBox.IsEmpty())
                 .Where(x => mode == "inside" ? x.BoundingBox.ContainedWithin(bounds) : x.BoundingBox.IntersectsWith(bounds))
                 .ToList();
-            await Perform(doc, new IOperation[] { new Deselect(doc.Selection.ToList()), new Select(objects) }, "selection.by_bounds", false).ConfigureAwait(true);
+            await Perform(doc, ReplaceSelectionOps(doc, objects), "selection.by_bounds").ConfigureAwait(true);
             return ToToken(SelectionGet(parameters));
         }
 
         private object HistoryList(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
+            var max = parameters.Optional<int?>("max", null);
             var history = HistoryFor(doc);
             lock (_historyLock)
             {
+                // The most recent entries sit at the end of both lists
+                var undo = max.HasValue ? history.Undo.TakeLast(Math.Max(0, max.Value)) : history.Undo;
+                var redo = max.HasValue ? history.Redo.TakeLast(Math.Max(0, max.Value)) : history.Redo;
                 return new
                 {
                     scope = "mcp",
                     undoCount = history.Undo.Count,
                     redoCount = history.Redo.Count,
-                    undo = history.Undo.Select(x => new { x.Description, x.CreatedUtc }).ToList(),
-                    redo = history.Redo.Select(x => new { x.Description, x.CreatedUtc }).ToList()
+                    undo = undo.Select(x => new { x.Description, x.CreatedUtc }).ToList(),
+                    redo = redo.Select(x => new { x.Description, x.CreatedUtc }).ToList()
                 };
             }
         }
@@ -2996,10 +3251,20 @@ namespace HammerTime.Mcp.Plugin
             {
                 if (!history.Undo.Any()) return ToToken(new { undone = false, reason = "No MCP history entries." });
                 entry = history.Undo.Last();
-                history.Undo.RemoveAt(history.Undo.Count - 1);
+            }
+            // Reversing an operation that is no longer the editor's newest one would leave the editor's own undo
+            // stack pointing at an already reversed change (Ctrl+Z would then reverse it a second time).
+            var stack = doc.Map.Data.GetOne<HistoryStack>();
+            if (stack != null && !ReferenceEquals(stack.UndoOperation(), entry.Operation))
+            {
+                throw new BridgeCommandException(ErrorCodes.InvalidOperation, "The newest change to this document was not made through MCP (it was edited in the editor since); use the editor's Undo, or continue editing.");
             }
             await MapDocumentOperation.Reverse(doc, entry.Operation).ConfigureAwait(true);
-            lock (_historyLock) history.Redo.Add(entry);
+            lock (_historyLock)
+            {
+                history.Undo.Remove(entry);
+                history.Redo.Add(entry);
+            }
             return ToToken(new { undone = true, entry.Description });
         }
 
@@ -3012,18 +3277,27 @@ namespace HammerTime.Mcp.Plugin
             {
                 if (!history.Redo.Any()) return ToToken(new { redone = false, reason = "No MCP redo entries." });
                 entry = history.Redo.Last();
-                history.Redo.RemoveAt(history.Redo.Count - 1);
+            }
+            var stack = doc.Map.Data.GetOne<HistoryStack>();
+            if (stack != null && !ReferenceEquals(stack.RedoOperation(), entry.Operation))
+            {
+                throw new BridgeCommandException(ErrorCodes.InvalidOperation, "The document changed since that operation was undone; it can no longer be redone.");
             }
             await MapDocumentOperation.Perform(doc, entry.Operation).ConfigureAwait(true);
-            lock (_historyLock) history.Undo.Add(entry);
+            lock (_historyLock)
+            {
+                history.Redo.Remove(entry);
+                history.Undo.Add(entry);
+            }
             return ToToken(new { redone = true, entry.Description });
         }
 
         private object CordonGet(JObject parameters)
         {
             var doc = ResolveDocument(parameters, false);
-            var cordon = doc.Map.Data.GetOne<CordonBounds>() ?? new CordonBounds();
-            return new { enabled = cordon.Enabled, bounds = cordon.Box.ToDto() };
+            var existing = doc.Map.Data.GetOne<CordonBounds>();
+            var cordon = existing ?? new CordonBounds();
+            return new { configured = existing != null, enabled = cordon.Enabled, bounds = cordon.Box.ToDto() };
         }
 
         private async Task<JToken> CordonSet(JObject parameters)
@@ -3052,12 +3326,10 @@ namespace HammerTime.Mcp.Plugin
             var enabled = parameters.Required<bool>("enabled");
             var cordon = doc.Map.Data.GetOne<CordonBounds>() ?? new CordonBounds();
             var box = cordon.Box;
-            var forwarded = new JObject(parameters)
-            {
-                ["min"] = JToken.FromObject(box.Start.ToDto()),
-                ["max"] = JToken.FromObject(box.End.ToDto()),
-                ["enabled"] = enabled
-            };
+            // Bounds given by the caller win; otherwise the current (or default) cordon box is kept
+            var forwarded = new JObject(parameters) { ["enabled"] = enabled };
+            if (forwarded["min"] == null || forwarded["min"].Type == JTokenType.Null) forwarded["min"] = JToken.FromObject(box.Start.ToDto());
+            if (forwarded["max"] == null || forwarded["max"].Type == JTokenType.Null) forwarded["max"] = JToken.FromObject(box.End.ToDto());
             return await CordonSet(forwarded).ConfigureAwait(true);
         }
 
@@ -3073,15 +3345,51 @@ namespace HammerTime.Mcp.Plugin
             return _context.Value.Get<MapDocument>("ActiveDocument");
         }
 
-        private MapDocument ResolveDocument(JObject parameters, bool requireExplicit)
+        // An open document by file name (or display name); paths are compared in normalised form.
+        private MapDocument FindOpenDocument(string path)
         {
-            if (parameters["path"] != null)
+            if (string.IsNullOrWhiteSpace(path)) return null;
+            var normalised = NormalizePath(path);
+            var open = _documents.Value.OpenDocuments.OfType<MapDocument>().ToList();
+            return open.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.FileName) && string.Equals(NormalizePath(x.FileName), normalised, StringComparison.InvariantCultureIgnoreCase))
+                   ?? open.FirstOrDefault(x => string.Equals(x.Name, path, StringComparison.InvariantCultureIgnoreCase));
+        }
+
+        private static string NormalizePath(string path)
+        {
+            try { return IOPath.GetFullPath(path); }
+            catch (Exception) { return path; }
+        }
+
+        // A stable id for an open document, valid for as long as it stays open.
+        private static string DocumentIdOf(MapDocument document)
+        {
+            if (document == null) return null;
+            return DocumentIds.GetValue(document, _ => Guid.NewGuid().ToString("N").Substring(0, 12));
+        }
+
+        private MapDocument DocumentById(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id)) return null;
+            return _documents.Value.OpenDocuments.OfType<MapDocument>().FirstOrDefault(x => string.Equals(DocumentIdOf(x), id, StringComparison.OrdinalIgnoreCase));
+        }
+
+        // pathSelectsDocument is false for tools whose `path` parameter is a file of their own (pointfiles).
+        private MapDocument ResolveDocument(JObject parameters, bool requireExplicit, bool pathSelectsDocument = true)
+        {
+            if (parameters["documentId"] != null)
+            {
+                var id = parameters.Optional<string>("documentId", null);
+                var byId = DocumentById(id);
+                if (byId != null) return byId;
+                throw new BridgeCommandException(ErrorCodes.DocumentNotFound, $"Open document id not found: {id}");
+            }
+
+            if (pathSelectsDocument && parameters["path"] != null)
             {
                 var path = parameters.Optional<string>("path", null);
-                var byPath = _documents.Value.OpenDocuments.OfType<MapDocument>().FirstOrDefault(x => string.Equals(x.FileName, path, StringComparison.InvariantCultureIgnoreCase));
+                var byPath = FindOpenDocument(path);
                 if (byPath != null) return byPath;
-                var byName = _documents.Value.OpenDocuments.OfType<MapDocument>().FirstOrDefault(x => string.Equals(x.Name, path, StringComparison.InvariantCultureIgnoreCase));
-                if (byName != null) return byName;
                 throw new BridgeCommandException(ErrorCodes.DocumentNotFound, $"Open document not found: {path}");
             }
 
@@ -3093,7 +3401,7 @@ namespace HammerTime.Mcp.Plugin
                 throw new BridgeCommandException(ErrorCodes.DocumentNotFound, $"Open document index not found: {index}");
             }
 
-            if (requireExplicit) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "Document path or documentIndex is required.");
+            if (requireExplicit) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "documentId, path or documentIndex is required.");
             return ActiveDocument();
         }
 
@@ -3119,11 +3427,14 @@ namespace HammerTime.Mcp.Plugin
             return null;
         }
 
+        // Keys that are not plain keyvalues: classname/spawnflags/origin have their own parameters, and "Location"
+        // is the editor's own move trigger.
         private static bool IsReservedEntityProperty(string name)
         {
             return string.Equals(name, "classname", StringComparison.InvariantCultureIgnoreCase) ||
                    string.Equals(name, "spawnflags", StringComparison.InvariantCultureIgnoreCase) ||
-                   string.Equals(name, "origin", StringComparison.InvariantCultureIgnoreCase);
+                   string.Equals(name, "origin", StringComparison.InvariantCultureIgnoreCase) ||
+                   string.Equals(name, "Location", StringComparison.InvariantCultureIgnoreCase);
         }
 
         private static void AddEntityDataUpdates(IMapObject entity, JObject parameters, ICollection<IOperation> ops)
@@ -3156,12 +3467,44 @@ namespace HammerTime.Mcp.Plugin
             return document.Map.Root.FindAll().Where(x => x.Hierarchy.Parent != null);
         }
 
+        /// <summary>The objects without an ancestor in the same set (a transform or delete recurses into children).</summary>
+        private static IEnumerable<IMapObject> TopLevel(IEnumerable<IMapObject> objects)
+        {
+            var set = new HashSet<IMapObject>(objects);
+            return set.Where(x =>
+            {
+                for (var p = x.Hierarchy.Parent; p != null; p = p.Hierarchy.Parent)
+                {
+                    if (set.Contains(p)) return false;
+                }
+                return true;
+            });
+        }
+
+        /// <summary>
+        /// The transform plus the texture transform the editor's select tool would add: with texture lock on, a
+        /// move or rotation keeps textures in place (uniform); with texture scale lock on, a scale scales them.
+        /// </summary>
+        private static IEnumerable<IOperation> TransformOps(MapDocument document, Matrix4x4 matrix, IEnumerable<IMapObject> objects, bool isScale = false)
+        {
+            var list = objects.ToList();
+            var ops = new List<IOperation> { new TransformOperation(matrix, list) };
+            var flags = document.Map.Data.GetOne<TransformationFlags>() ?? new TransformationFlags();
+            if (!isScale && flags.TextureLock) ops.Add(new TransformTexturesUniform(matrix, list.SelectMany(x => x.FindAll())));
+            else if (isScale && flags.TextureScaleLock) ops.Add(new TransformTexturesScale(matrix, list.SelectMany(x => x.FindAll())));
+            return ops;
+        }
+
         private IEnumerable<IMapObject> FilterObjects(MapDocument document, IEnumerable<IMapObject> source, JObject parameters)
         {
             var type = parameters.Optional<string>("type", null);
             var classname = parameters.Optional<string>("classname", null);
             var texture = parameters.Optional<string>("texture", null);
             var bounds = parameters["min"] != null || parameters["max"] != null ? RequiredBox(parameters) : null;
+            if (!string.IsNullOrWhiteSpace(type) && !new[] { "Solid", "Entity", "Group" }.Contains(type, StringComparer.InvariantCultureIgnoreCase))
+            {
+                throw new BridgeCommandException(ErrorCodes.InvalidRequest, "type must be Solid, Entity, or Group.");
+            }
 
             var query = source;
             if (!string.IsNullOrWhiteSpace(type))
@@ -3174,7 +3517,8 @@ namespace HammerTime.Mcp.Plugin
             }
             if (!string.IsNullOrWhiteSpace(texture))
             {
-                query = query.Where(x => x.Data.OfType<Face>().Any(f => string.Equals(f.Texture.Name, texture, StringComparison.InvariantCultureIgnoreCase)));
+                // an entity or group uses the texture when any of its brushes does
+                query = query.Where(x => SolidsOf(new[] { x }).Any(s => s.Faces.Any(f => string.Equals(f.Texture.Name, texture, StringComparison.InvariantCultureIgnoreCase))));
             }
             if (bounds != null)
             {
@@ -3242,6 +3586,44 @@ namespace HammerTime.Mcp.Plugin
         private static IEnumerable<Solid> SolidsOf(IEnumerable<IMapObject> objects)
         {
             return objects.SelectMany(x => x.FindAll()).OfType<Solid>().Where(x => x.Hierarchy.Parent != null).Distinct();
+        }
+
+        /// <summary>Every solid inside <paramref name="objects"/> (groups and brush entities contribute their brushes).</summary>
+        private static IEnumerable<Solid> SolidsOf(IEnumerable<IMapObject> objects)
+        {
+            return objects.SelectMany(x => x.FindAll()).OfType<Solid>().Where(x => x.Hierarchy.Parent != null).Distinct();
+        }
+
+        /// <summary>
+        /// Operations that make <paramref name="targets"/> the selection. Targets already selected stay selected:
+        /// the editor's Select drops already-selected objects when it is built, so a plain "deselect everything,
+        /// select targets" would end with those objects deselected.
+        /// </summary>
+        private static IEnumerable<IOperation> ReplaceSelectionOps(MapDocument document, IEnumerable<IMapObject> targets)
+        {
+            var wanted = new HashSet<IMapObject>(targets);
+            return new IOperation[]
+            {
+                new Deselect(document.Selection.Where(x => !wanted.Contains(x)).ToList()),
+                new Select(wanted)
+            };
+        }
+
+        /// <summary>Point-entity creation refuses classes the FGD marks as brush entities (they need entity_tie_brushes).</summary>
+        private async Task RejectBrushEntityClass(MapDocument doc, string classname)
+        {
+            GameData data;
+            try { data = await doc.Environment.GetGameData().ConfigureAwait(true); }
+            catch (Exception ex)
+            {
+                Log("RejectBrushEntityClass: game data unavailable: " + ex.Message);
+                return;
+            }
+            var schema = data?.GetClass(classname);
+            if (schema != null && schema.ClassType == ClassType.Solid)
+            {
+                throw new BridgeCommandException(ErrorCodes.InvalidRequest, $"'{classname}' is a brush entity in the FGD: create brushes and tie them with entity_tie_brushes instead of entity_create.");
+            }
         }
 
         private IEnumerable<FaceRef> ResolveFaceRefs(MapDocument document, JArray array)
@@ -3507,128 +3889,6 @@ namespace HammerTime.Mcp.Plugin
             return new PlaneDefinition(plane, texture);
         }
 
-        private static string SolidToMapText(Solid solid)
-        {
-            var builder = new StringBuilder();
-            builder.AppendLine("{");
-            foreach (var face in solid.Faces)
-            {
-                var points = face.Vertices.Take(3).ToList();
-                if (points.Count < 3) continue;
-                builder.AppendFormat(System.Globalization.CultureInfo.InvariantCulture,
-                    "( {0} {1} {2} ) ( {3} {4} {5} ) ( {6} {7} {8} ) {9} [ {10} {11} {12} {13} ] [ {14} {15} {16} {17} ] {18} {19} {20}\r\n",
-                    points[0].X, points[0].Y, points[0].Z,
-                    points[1].X, points[1].Y, points[1].Z,
-                    points[2].X, points[2].Y, points[2].Z,
-                    face.Texture.Name,
-                    face.Texture.UAxis.X, face.Texture.UAxis.Y, face.Texture.UAxis.Z, face.Texture.XShift,
-                    face.Texture.VAxis.X, face.Texture.VAxis.Y, face.Texture.VAxis.Z, face.Texture.YShift,
-                    face.Texture.Rotation, face.Texture.XScale, face.Texture.YScale);
-            }
-            builder.AppendLine("}");
-            return builder.ToString();
-        }
-
-        private static List<string> SplitBrushBlocks(string text)
-        {
-            var blocks = new List<string>();
-            var builder = new StringBuilder();
-            var depth = 0;
-            foreach (var rawLine in text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
-            {
-                var trimmed = rawLine.Trim();
-                if (depth == 0)
-                {
-                    if (trimmed == "{")
-                    {
-                        builder.Clear();
-                        builder.AppendLine(rawLine);
-                        depth = 1;
-                    }
-                }
-                else
-                {
-                    builder.AppendLine(rawLine);
-                    if (trimmed == "{") depth++;
-                    else if (trimmed == "}") depth--;
-                    if (depth == 0)
-                    {
-                        blocks.Add(builder.ToString());
-                        builder.Clear();
-                    }
-                }
-            }
-            return blocks;
-        }
-
-        private static Solid ParseSolidMapText(string text, UniqueNumberGenerator generator)
-        {
-            var definitions = new List<PlaneDefinition>();
-            foreach (var line in text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
-            {
-                var trimmed = line.Trim();
-                if (trimmed.Length == 0 || trimmed == "{" || trimmed == "}") continue;
-                definitions.Add(ParseMapFaceLine(trimmed));
-            }
-            if (definitions.Count < 4) throw new BridgeCommandException(ErrorCodes.InvalidRequest, "Map text must contain at least 4 brush side lines.");
-
-            var polyhedron = new Polyhedron(definitions.Select(x => x.Plane));
-            if (!polyhedron.IsValid()) throw new BridgeCommandException(ErrorCodes.InvalidOperation, "Map text did not produce a valid convex brush.");
-            var solid = new Solid(generator.Next("MapObject"));
-            foreach (var polygon in polyhedron.Polygons)
-            {
-                var definition = definitions.OrderByDescending(x => Vector3.Dot(x.Plane.Normal, polygon.Plane.Normal)).First();
-                var face = new Face(generator.Next("Face")) { Texture = definition.Texture.Clone() };
-                face.Vertices.AddRange(polygon.Vertices);
-                solid.Data.Add(face);
-            }
-            return solid;
-        }
-
-        private static PlaneDefinition ParseMapFaceLine(string line)
-        {
-            var pattern = @"^\(\s*(?<p1>[^)]*?)\s*\)\s*\(\s*(?<p2>[^)]*?)\s*\)\s*\(\s*(?<p3>[^)]*?)\s*\)\s*(?<tex>\S+)\s*\[\s*(?<u>[^\]]+)\]\s*\[\s*(?<v>[^\]]+)\]\s*(?<rot>-?\d+(?:\.\d+)?)\s*(?<xs>-?\d+(?:\.\d+)?)\s*(?<ys>-?\d+(?:\.\d+)?)";
-            var match = Regex.Match(line, pattern);
-            if (!match.Success) throw new BridgeCommandException(ErrorCodes.ParseError, "Could not parse map brush side: " + line);
-            var u = ParseFloatList(match.Groups["u"].Value, 4);
-            var v = ParseFloatList(match.Groups["v"].Value, 4);
-            var texture = new Texture
-            {
-                Name = match.Groups["tex"].Value,
-                UAxis = new Vector3(u[0], u[1], u[2]),
-                XShift = u[3],
-                VAxis = new Vector3(v[0], v[1], v[2]),
-                YShift = v[3],
-                Rotation = ParseFloat(match.Groups["rot"].Value),
-                XScale = ParseFloat(match.Groups["xs"].Value),
-                YScale = ParseFloat(match.Groups["ys"].Value)
-            };
-            return new PlaneDefinition(
-                new Plane(ParseMapVector(match.Groups["p1"].Value), ParseMapVector(match.Groups["p2"].Value), ParseMapVector(match.Groups["p3"].Value)),
-                texture);
-        }
-
-        private static Vector3 ParseMapVector(string text)
-        {
-            var values = ParseFloatList(text, 3);
-            return new Vector3(values[0], values[1], values[2]);
-        }
-
-        private static float[] ParseFloatList(string text, int min)
-        {
-            var values = Regex.Matches(text, @"-?\d+(?:\.\d+)?")
-                .Cast<Match>()
-                .Select(x => ParseFloat(x.Value))
-                .ToArray();
-            if (values.Length < min) throw new BridgeCommandException(ErrorCodes.ParseError, "Expected at least " + min + " numeric values in: " + text);
-            return values;
-        }
-
-        private static float ParseFloat(string value)
-        {
-            return float.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
-        }
-
         private static string VertexKey(Vector3 point)
         {
             return string.Format(System.Globalization.CultureInfo.InvariantCulture, "v:{0:0.###}:{1:0.###}:{2:0.###}", point.X, point.Y, point.Z);
@@ -3712,13 +3972,16 @@ namespace HammerTime.Mcp.Plugin
             await Perform(document, operations, "mcp operation").ConfigureAwait(true);
         }
 
-        private async Task Perform(MapDocument document, IEnumerable<IOperation> operations, string description, bool recordHistory = true)
+        private async Task Perform(MapDocument document, IEnumerable<IOperation> operations, string description)
         {
             var list = operations.Where(x => x != null).ToList();
             if (!list.Any()) return;
             var transaction = new Transaction(list);
             await MapDocumentOperation.Perform(document, transaction).ConfigureAwait(true);
-            if (recordHistory && !transaction.Trivial)
+            // Every non-trivial transaction lands on the editor's undo stack, selection changes included, so it
+            // is recorded here too: MCP undo only reverses the editor's newest operation, and an unrecorded one
+            // would block it.
+            if (!transaction.Trivial)
             {
                 var history = HistoryFor(document);
                 lock (_historyLock)
@@ -3904,11 +4167,9 @@ namespace HammerTime.Mcp.Plugin
             return control.GetType().Name;
         }
 
-        private static void ApplyBrushParameters(IBrush brush, JObject parameters)
+        private static void ApplyBrushParameters(IReadOnlyList<BrushControlBinding> bindings, JObject parameters)
         {
-            if (parameters == null) return;
-            var bindings = ReadBrushControls(brush);
-            if (!bindings.Any()) return;
+            if (parameters == null || !bindings.Any()) return;
 
             foreach (var property in parameters.Properties())
             {
@@ -3931,6 +4192,7 @@ namespace HammerTime.Mcp.Plugin
             if (document == null) return null;
             return new
             {
+                documentId = DocumentIdOf(document as MapDocument),
                 name = document.Name,
                 path = document.FileName,
                 type = document.GetType().FullName,
@@ -4227,8 +4489,7 @@ namespace HammerTime.Mcp.Plugin
             {
                 var directory = System.IO.Path.GetDirectoryName(McpBridgeConfig.GetDefaultConfigPath());
                 if (string.IsNullOrWhiteSpace(directory)) return;
-                Directory.CreateDirectory(directory);
-                File.AppendAllText(System.IO.Path.Combine(directory, "bridge.log"), DateTimeOffset.Now.ToString("O") + " " + message + Environment.NewLine);
+                BridgeLog.Append(System.IO.Path.Combine(directory, "bridge.log"), message);
             }
             catch
             {
@@ -4260,18 +4521,6 @@ namespace HammerTime.Mcp.Plugin
             public IMapObject Object { get; }
             public Face Face { get; }
             public int VertexIndex { get; }
-        }
-
-        private sealed class PlaneDefinition
-        {
-            public PlaneDefinition(Plane plane, Texture texture)
-            {
-                Plane = plane;
-                Texture = texture;
-            }
-
-            public Plane Plane { get; }
-            public Texture Texture { get; }
         }
 
         private sealed class OperationHistory
@@ -4372,6 +4621,26 @@ namespace HammerTime.Mcp.Plugin
                     label = Label,
                     type = Kind
                 };
+            }
+
+            // The control's current value, for restoring it after a call's temporary override.
+            public object CurrentValue()
+            {
+                if (Control is NumericControl n) return n.Value;
+                if (Control is BooleanControl b) return b.Checked;
+                if (Control is TextControl t) return t.EnteredText;
+                if (Control is FontChooserControl f) return f.FontName;
+                return null;
+            }
+
+            // Put back a value read by CurrentValue; untouched controls are left alone so the sidebar does not
+            // see a spurious change.
+            public void RestoreValue(object value)
+            {
+                if (Control is NumericControl n) { if (value is decimal d && n.Value != d) n.Value = d; }
+                else if (Control is BooleanControl b) { if (value is bool v && b.Checked != v) b.Checked = v; }
+                else if (Control is TextControl t) { if (!string.Equals(t.EnteredText, value as string, StringComparison.Ordinal)) t.EnteredText = value as string; }
+                else if (Control is FontChooserControl f) { if (!string.Equals(f.FontName, value as string, StringComparison.Ordinal)) f.FontName = value as string; }
             }
 
             public void SetValue(JToken value)
