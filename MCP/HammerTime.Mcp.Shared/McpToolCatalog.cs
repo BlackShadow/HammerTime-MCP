@@ -135,7 +135,7 @@ namespace HammerTime.Mcp.Shared
 
                 // Compile
                 Tool("compile_profiles_list", BridgeMethods.CompileProfilesList, "List built-in MCP compile profiles."),
-                Tool("compile_run", BridgeMethods.CompileRun, "Run a compile profile and capture logs."),
+                Tool("compile_run", BridgeMethods.CompileRun, "Run fast (CSG/BSP), full (CSG/BSP/VIS/RAD), or custom steps with optional arguments keyed by stage name. Requires configured compiler executables; success requires completed stages, zero exit codes, and a newly produced or updated non-empty BSP. Capture output with compile_log_tail."),
                 Tool("compile_log_tail", BridgeMethods.CompileLogTail, "Return recent compile log lines."),
 
                 // History

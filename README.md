@@ -124,6 +124,16 @@ dotnet test .\HammerTime.MCP.sln -c Debug /p:Platform="Any CPU"
 
 ## Notes
 
+### Compilation
+
+Configure the compiler executables in the map's HammerTime environment before calling `compile_run`. The built-in `fast` profile runs CSG and BSP; `full` runs CSG, BSP, VIS and RAD. Stage selection preserves the editor's map export, output checks and result-copying steps. Compiler flags go in `arguments`, keyed by stage name, for example:
+
+```json
+{"profile":"full","arguments":{"VIS":"-fast","RAD":"-bounce 0"}}
+```
+
+For `custom`, provide a non-empty `steps` array or select stages through `arguments`. Stages run in CSG/BSP/VIS/RAD order. Missing executables, unsupported profiles and invalid stage selections return an error. A compile succeeds only when every selected compiler completes with exit code zero and produces or updates a non-empty BSP. Compiler failures and interruptions return `successful: false`; use `compile_log_tail` for details. A supplied `workingDirectory` is retained; automatically created temporary directories are cleaned up after output verification and result copying.
+
 The bridge config is stored at:
 
 ```text

@@ -3046,6 +3046,8 @@ namespace HammerTime.Mcp.Plugin
             var log = new CompileRunLog { Id = runId, Profile = profile, StartedUtc = DateTime.UtcNow };
             lock (_compileLock)
             {
+                if (_activeCompileRunId != null)
+                    throw new BridgeCommandException(ErrorCodes.InvalidOperation, "Another MCP compilation is already running.");
                 _compileRuns[runId] = log;
                 _activeCompileRunId = runId;
                 // Keep the last runs only (each holds up to 4000 log lines)
@@ -3059,12 +3061,17 @@ namespace HammerTime.Mcp.Plugin
             {
                 return await RunCompileBatch(doc, parameters, profile, runId, log).ConfigureAwait(true);
             }
+            catch (Exception ex)
+            {
+                AddCompileLog("error", ex.Message);
+                throw;
+            }
             finally
             {
                 // Also when the batch throws: the run must not stay "active" and collect later compiles' output
-                if (log.FinishedUtc == null) log.FinishedUtc = DateTime.UtcNow;
                 lock (_compileLock)
                 {
+                    if (log.FinishedUtc == null) log.FinishedUtc = DateTime.UtcNow;
                     if (_activeCompileRunId == runId) _activeCompileRunId = null;
                 }
             }
@@ -3072,13 +3079,31 @@ namespace HammerTime.Mcp.Plugin
 
         private async Task<JToken> RunCompileBatch(MapDocument doc, JObject parameters, string profile, string runId, CompileRunLog log)
         {
-            var args = new List<BatchArgument>();
+            if (parameters["steps"] != null && !(parameters["steps"] is JArray))
+                throw new BridgeCommandException(ErrorCodes.InvalidRequest, "steps must be an array of compiler stage names.");
+            if (parameters["arguments"] != null && !(parameters["arguments"] is JObject))
+                throw new BridgeCommandException(ErrorCodes.InvalidRequest, "arguments must be an object keyed by compiler stage name.");
+
+            var arguments = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var prop in (parameters["arguments"] as JObject ?? new JObject()).Properties())
             {
-                args.Add(new BatchArgument { Name = prop.Name, Arguments = prop.Value.Type == JTokenType.Null ? "" : prop.Value.ToString() });
+                if (!CompilePipeline.StageNames.Contains(prop.Name, StringComparer.OrdinalIgnoreCase))
+                    throw new BridgeCommandException(ErrorCodes.InvalidRequest, $"Unknown compiler stage '{prop.Name}' in arguments. Use CSG, BSP, VIS or RAD.");
+                arguments[prop.Name] = prop.Value.Type == JTokenType.Null ? "" : prop.Value.ToString();
             }
 
             var steps = CompileStepNames(parameters["steps"] as JArray, profile);
+            if (profile == "custom" && parameters["steps"] == null)
+                steps = CompilePipeline.StageNames.Where(arguments.ContainsKey).ToList();
+            if (steps.Count == 0)
+                throw new BridgeCommandException(ErrorCodes.InvalidRequest, "No compiler stages selected. A custom profile requires steps or stage arguments.");
+
+            // CreateBatch selects compilers by argument name, including stages with no extra flags.
+            var args = steps.Select(stage => new BatchArgument
+            {
+                Name = stage,
+                Arguments = arguments.TryGetValue(stage, out var flags) ? flags : ""
+            }).ToList();
             var options = new BatchOptions
             {
                 AllowUserInterruption = parameters.Optional("allowUserInterruption", false),
@@ -3092,26 +3117,36 @@ namespace HammerTime.Mcp.Plugin
                     BatchStepType.ExportDocument,
                     BatchStepType.RunBuildExecutable,
                     BatchStepType.CheckIfSuccessful,
-                    BatchStepType.ProcessBuildResults,
-                    BatchStepType.DeleteWorkingDirectory
+                    BatchStepType.ProcessBuildResults
                 }
             };
+            // The editor deletes the entire working directory. Only let it delete its own temporary folder.
+            if (options.WorkingDirectory == null) options.BatchSteps.Add(BatchStepType.DeleteWorkingDirectory);
             if (parameters.Optional("runGame", false)) options.BatchSteps.Add(BatchStepType.RunGame);
 
-            var batch = await doc.Environment.CreateBatch(args, options).ConfigureAwait(true);
-            if (steps.Any())
+            if (doc.Environment == null)
+                throw new BridgeCommandException(ErrorCodes.InvalidOperation, "The document has no compiler environment configured.");
+            Batch batch;
+            try
             {
-                batch.Steps = batch.Steps.Where(x => steps.Any(step => x.GetType().Name.IndexOf(step, StringComparison.InvariantCultureIgnoreCase) >= 0)).ToList();
+                batch = await doc.Environment.CreateBatch(args, options).ConfigureAwait(true);
             }
+            catch (ArgumentException ex)
+            {
+                throw new BridgeCommandException(ErrorCodes.InvalidOperation, "The compiler environment could not create a batch. Check its compiler paths: " + ex.Message);
+            }
+            var compilation = CompilePipeline.Prepare(batch, steps, (kind, line) => Oy.Publish("Compile:" + kind, line));
             await batch.Run(doc).ConfigureAwait(true);
+            var successful = batch.Successful && compilation.Successful;
+            if (!successful) AddCompileLog("error", "Compilation failed or did not complete all selected stages and output verification.");
             int lineCount;
             lock (_compileLock)
             {
-                log.Successful = batch.Successful;
+                log.Successful = successful;
                 log.FinishedUtc = DateTime.UtcNow;
                 lineCount = log.Lines.Count;
             }
-            return ToToken(new { runId, profile, successful = batch.Successful, logLines = lineCount });
+            return ToToken(new { runId, profile, successful, logLines = lineCount });
         }
 
         private object CompileLogTail(JObject parameters)
@@ -3930,7 +3965,19 @@ namespace HammerTime.Mcp.Plugin
 
         private static List<string> CompileStepNames(JArray explicitSteps, string profile)
         {
-            if (explicitSteps != null) return explicitSteps.Select(x => x.Value<string>()).Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
+            if (profile != "fast" && profile != "full" && profile != "custom")
+                throw new BridgeCommandException(ErrorCodes.InvalidRequest, $"Unknown compile profile '{profile}'. Use fast, full or custom.");
+            if (explicitSteps != null)
+            {
+                var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var token in explicitSteps)
+                {
+                    if (token.Type != JTokenType.String || !CompilePipeline.StageNames.Contains(token.Value<string>(), StringComparer.OrdinalIgnoreCase))
+                        throw new BridgeCommandException(ErrorCodes.InvalidRequest, "Unknown compiler stage in steps. Use CSG, BSP, VIS or RAD.");
+                    selected.Add(token.Value<string>());
+                }
+                return CompilePipeline.StageNames.Where(selected.Contains).ToList();
+            }
             if (profile == "fast") return new List<string> { "CSG", "BSP" };
             if (profile == "full") return new List<string> { "CSG", "BSP", "VIS", "RAD" };
             return new List<string>();
