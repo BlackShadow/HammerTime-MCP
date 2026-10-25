@@ -84,10 +84,10 @@ dotnet build .\HammerTime.MCP.sln -c Debug /p:Platform="Any CPU" /p:HammerTimeEd
 
 Download the zip file in Releases
 
-Run the bundled installer:
+Extract the release archive and run the bundled installer from that directory:
 
 ```powershell
-.\MCP-Install\install.bat
+.\install.bat
 ```
 
 Make sure HammerTime is not running while installing.
@@ -97,8 +97,16 @@ The installer can configure several MCP clients, including Codex, Cursor, VS Cod
 Installer should auto-detect HammerTime installation path but if path is not detected automatically:
 
 ```powershell
-.\MCP-Install\install.bat codex user "C:\Program Files (x86)\HammertimeEditor"
+.\install.bat opencode user "D:\HammertimeEditor"
 ```
+
+Project scope uses the directory from which you launch the installer. To select another project, pass its directory as the fourth argument:
+
+```powershell
+.\install.bat opencode project "D:\HammertimeEditor" "D:\MyMaps"
+```
+
+In a source checkout, the installer is at `MCP\MCP-Install\install.bat`.
 
 After a successful install, Run HammerTime and restart your AI CLI or IDE.
 
@@ -107,13 +115,13 @@ After a successful install, Run HammerTime and restart your AI CLI or IDE.
 With HammerTime running, check the bridge:
 
 ```powershell
-.\MCP-Install\Server\hammertime-mcp.exe status
+.\Server\hammertime-mcp.exe status
 ```
 
 For diagnostics:
 
 ```powershell
-.\MCP-Install\Server\hammertime-mcp.exe doctor
+.\Server\hammertime-mcp.exe doctor
 ```
 
 Run tests:
